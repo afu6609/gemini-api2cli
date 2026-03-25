@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git pull:*)",
+      "Bash(git fetch:*)",
+      "Bash(ls:*)",
+      "Bash(find /c/Users/Haa/Desktop/gemini-cli/packages/a2a-server/src -type f -name \"*.ts\" -exec grep -l \"Gemini\\\\|OpenAI\\\\|format\\\\|adapter\" {})",
+      "Bash(git merge:*)"
+    ]
+  }
+}

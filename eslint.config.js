@@ -318,6 +318,20 @@ export default tseslint.config(
       'import/enforce-node-protocol-usage': ['error', 'always'],
     },
   },
+  // CNC-1.0 licensed files added by gemini-api2cli – different header format
+  {
+    files: [
+      'packages/a2a-server/src/http/promptApi.ts',
+      'packages/a2a-server/src/http/promptApi.test.ts',
+      'packages/a2a-server/src/http/promptApiAuth.ts',
+      'packages/a2a-server/src/http/promptApiConsole.ts',
+      'packages/a2a-server/src/http/promptCredentialStore.ts',
+      'packages/a2a-server/src/http/adapters/*.ts',
+    ],
+    rules: {
+      'headers/header-format': 'off',
+    },
+  },
   {
     files: [
       './scripts/**/*.js',

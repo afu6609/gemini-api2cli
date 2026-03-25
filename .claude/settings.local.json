@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git -C /c/Users/Haa/Desktop/gemini-cli show --stat HEAD)",
+      "Bash(git -C /c/Users/Haa/Desktop/gemini-cli diff package.json)",
+      "Bash(git -C /c/Users/Haa/Desktop/gemini-cli diff packages/a2a-server/README.md)",
+      "Bash(git:*)",
+      "Bash(npx tsc:*)",
+      "Bash(npx vitest:*)",
+      "Bash(git checkout:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(npx eslint:*)",
+      "Read(//c/Users/Haa/AppData/Local/Temp/claude/C--Users-Haa-Desktop-gemini-cli/70011a99-1280-46b3-86a3-e356c8fbda9a/tasks/**)",
+      "Bash(echo \"EXIT:$?\")"
+    ]
+  }
+}

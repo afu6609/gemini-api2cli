@@ -4,118 +4,331 @@
 
 `gemini-api2cli` is a web-facing API bridge built on top of Gemini CLI. It keeps
 Gemini CLI as the execution engine, then adds a browser console, token-based
-authentication, managed Google credential switching, quota inspection, and
-multiple request/response formats on top.
+authentication, managed Google credential switching, quota inspection, request
+settings (rotation / retry / timeout), and Gemini-style plus OpenAI-compatible
+request/response formats.
 
 This repository is currently a fork/adaptation of Gemini CLI, so some internal
-package names still refer to `gemini-cli` or `a2a-server`. The external product
-surface described here is the `gemini-api2cli` layer.
+package names still refer to `gemini-cli` or `a2a-server`.
 
 ## What It Does
 
-- Exposes a browser console at `/manage`
-- Wraps Gemini CLI as an HTTP service
+- Exposes a browser console at `/manage` (English / Chinese i18n)
+- Wraps Gemini CLI as an HTTP API service
 - Supports managed Google OAuth credentials with switchable active account
+- Supports credential rotation (round-robin) and error retry
 - Provides quota inspection and credential polling
-- Adds token auth plus an optional open-API mode
+- Adds token auth (covering both Web and API requests), plus optional open-API
+  mode
 - Supports both Gemini-style and OpenAI-compatible API formats
 
-## Main Endpoints
+## Quick Start
+
+### Prerequisites
+
+- Node.js >= 20
+- npm >= 10
+- Gemini CLI dependencies installed (`npm install`)
+
+### Local Setup
+
+```bash
+npm install
+npm run start:a2a-server
+```
+
+Then open the management console:
+
+```
+http://localhost:41242/manage
+```
+
+On first visit you will need to enter a token. The default is `root`
+(configurable via environment variable).
+
+### Environment Variables
+
+| Variable                  | Description          | Default |
+| ------------------------- | -------------------- | ------- |
+| `GEMINI_PROMPT_API_TOKEN` | API / Web auth token | `root`  |
+| `CODER_AGENT_PORT`        | Server listen port   | `41242` |
+
+### Docker Deployment
+
+```bash
+docker build -t gemini-api2cli .
+docker run -d -p 41242:41242 \
+  -e GEMINI_PROMPT_API_TOKEN=your_token \
+  gemini-api2cli
+```
+
+If no Dockerfile exists, use this as a starting point:
+
+```dockerfile
+FROM node:20-slim
+WORKDIR /app
+COPY . .
+RUN npm install && npm run build --workspace @google/gemini-cli-core && npm run build --workspace @google/gemini-cli-a2a-server
+EXPOSE 41242
+ENV CODER_AGENT_PORT=41242
+CMD ["npm", "run", "start", "--workspace", "@google/gemini-cli-a2a-server"]
+```
+
+## Endpoints
 
 ### Web Console
 
-- `GET /manage`
+| Method | Path      | Description           |
+| ------ | --------- | --------------------- |
+| GET    | `/manage` | Browser management UI |
 
 ### Auth
 
-- `GET /v1/auth/check`
-- `POST /v1/auth/login`
-- `PUT /v1/auth/token`
-- `GET /v1/auth/open-api`
-- `PUT /v1/auth/open-api`
+| Method | Path                | Description                    |
+| ------ | ------------------- | ------------------------------ |
+| GET    | `/v1/auth/check`    | Check if token is valid        |
+| POST   | `/v1/auth/login`    | Login with token (for console) |
+| PUT    | `/v1/auth/token`    | Change the runtime token       |
+| GET    | `/v1/auth/open-api` | Query open-API mode status     |
+| PUT    | `/v1/auth/open-api` | Enable/disable open-API mode   |
 
 ### Settings
 
-- `GET /v1/settings`
-- `PUT /v1/settings`
+| Method | Path           | Description                                     |
+| ------ | -------------- | ----------------------------------------------- |
+| GET    | `/v1/settings` | Get current settings (includes default timeout) |
+| PUT    | `/v1/settings` | Update rotation / retry / timeout settings      |
 
 ### Models
 
-- `GET /v1/models`
-- `GET /v1/models/current`
-- `PUT /v1/models/current`
+| Method | Path                 | Description               |
+| ------ | -------------------- | ------------------------- |
+| GET    | `/v1/models`         | List available models     |
+| GET    | `/v1/models/current` | Get current default model |
+| PUT    | `/v1/models/current` | Set default model         |
 
 ### Credentials
 
-- `GET /v1/credentials`
-- `DELETE /v1/credentials`
-- `DELETE /v1/credentials/:credentialId`
-- `GET /v1/credentials/current`
-- `PUT /v1/credentials/current`
-- `POST /v1/credentials/login`
-- `GET /v1/credentials/login/:loginId`
-- `POST /v1/credentials/login/:loginId/complete`
+| Method | Path                                      | Description                  |
+| ------ | ----------------------------------------- | ---------------------------- |
+| GET    | `/v1/credentials`                         | List all credentials         |
+| DELETE | `/v1/credentials`                         | Delete all credentials       |
+| DELETE | `/v1/credentials/:credentialId`           | Delete a specific credential |
+| GET    | `/v1/credentials/current`                 | Get the active credential    |
+| PUT    | `/v1/credentials/current`                 | Switch active credential     |
+| POST   | `/v1/credentials/login`                   | Start Google account login   |
+| GET    | `/v1/credentials/login/:loginId`          | Poll login status            |
+| POST   | `/v1/credentials/login/:loginId/complete` | Complete login callback      |
 
 ### Quotas
 
-- `GET /v1/quotas`
-- `GET /v1/quotas/:credentialId`
+| Method | Path                       | Description                           |
+| ------ | -------------------------- | ------------------------------------- |
+| GET    | `/v1/quotas`               | Query quotas for all credentials      |
+| GET    | `/v1/quotas/:credentialId` | Query quota for a specific credential |
 
 ### Gemini-Style Endpoints
 
-- `POST /v1/gemini/generateContent`
-- `POST /v1/gemini/streamGenerateContent`
+| Method | Path                               | Description              |
+| ------ | ---------------------------------- | ------------------------ |
+| POST   | `/v1/gemini/generateContent`       | Non-streaming generation |
+| POST   | `/v1/gemini/streamGenerateContent` | SSE streaming generation |
 
 ### OpenAI-Compatible Endpoint
 
-- `POST /v1/openai/chat/completions`
+| Method | Path                          | Description                                |
+| ------ | ----------------------------- | ------------------------------------------ |
+| POST   | `/v1/openai/chat/completions` | Chat Completions (supports `stream: true`) |
 
-## Request and Response Formats
+## Usage Examples
 
-`gemini-api2cli` now supports three surface styles:
+All examples below assume the service is running at `localhost:41242` with token
+`root`.
 
-1. Internal prompt API style
-   - Used by the management console and some direct routes
-   - Wraps Gemini CLI in a project-specific JSON format
+### OpenAI-Compatible Format (Recommended)
 
-2. Gemini-style format
-   - Accepts Gemini-like request bodies with `contents` and `systemInstruction`
-   - Returns Gemini-like JSON or SSE chunks
+**Non-streaming:**
 
-3. OpenAI-compatible format
-   - Accepts `chat.completions` style requests with `messages`
-   - Returns OpenAI-like JSON or SSE chunks
+```bash
+curl -X POST http://localhost:41242/v1/openai/chat/completions \
+  -H "Authorization: Bearer root" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"gemini-2.5-pro","messages":[{"role":"user","content":"Hello"}]}'
+```
 
-Under the hood, all of them still run through Gemini CLI.
+**Streaming:**
+
+```bash
+curl -X POST http://localhost:41242/v1/openai/chat/completions \
+  -H "Authorization: Bearer root" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"gemini-2.5-pro","messages":[{"role":"user","content":"Hello"}],"stream":true}'
+```
+
+**With system prompt:**
+
+```bash
+curl -X POST http://localhost:41242/v1/openai/chat/completions \
+  -H "Authorization: Bearer root" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"gemini-2.5-pro","messages":[{"role":"system","content":"You are a translator."},{"role":"user","content":"Hello world"}]}'
+```
+
+**Response example (non-streaming):**
+
+```json
+{
+  "id": "req-xxxxxxxx",
+  "object": "chat.completion",
+  "created": 1711234567,
+  "model": "gemini-2.5-pro",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "Hello! How can I help you?"
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": { "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0 }
+}
+```
+
+### Gemini-Style Format
+
+**Non-streaming:**
+
+```bash
+curl -X POST http://localhost:41242/v1/gemini/generateContent \
+  -H "Authorization: Bearer root" \
+  -H "Content-Type: application/json" \
+  -d '{"contents":[{"role":"user","parts":[{"text":"Hello"}]}],"generationConfig":{"model":"gemini-2.5-pro"}}'
+```
+
+**Streaming:**
+
+```bash
+curl -X POST http://localhost:41242/v1/gemini/streamGenerateContent \
+  -H "Authorization: Bearer root" \
+  -H "Content-Type: application/json" \
+  -d '{"contents":[{"role":"user","parts":[{"text":"Hello"}]}]}'
+```
+
+**With systemInstruction:**
+
+```bash
+curl -X POST http://localhost:41242/v1/gemini/generateContent \
+  -H "Authorization: Bearer root" \
+  -H "Content-Type: application/json" \
+  -d '{"contents":[{"role":"user","parts":[{"text":"Hello"}]}],"systemInstruction":{"parts":[{"text":"Reply in Chinese"}]}}'
+```
+
+**Response example (non-streaming):**
+
+```json
+{
+  "candidates": [
+    {
+      "content": { "parts": [{ "text": "Hello!" }], "role": "model" },
+      "finishReason": "STOP"
+    }
+  ],
+  "modelVersion": "gemini-2.5-pro"
+}
+```
+
+### PowerShell Examples
+
+```powershell
+# OpenAI format
+Invoke-RestMethod -Method Post -Uri "http://localhost:41242/v1/openai/chat/completions" -Headers @{Authorization="Bearer root";"Content-Type"="application/json"} -Body '{"model":"gemini-2.5-pro","messages":[{"role":"user","content":"Hello"}]}'
+
+# Gemini format
+Invoke-RestMethod -Method Post -Uri "http://localhost:41242/v1/gemini/generateContent" -Headers @{Authorization="Bearer root";"Content-Type"="application/json"} -Body '{"contents":[{"role":"user","parts":[{"text":"Hello"}]}]}'
+```
+
+## Specifying Models
+
+You can specify a model in each request:
+
+| Format            | Field Location                                | Example                                                    |
+| ----------------- | --------------------------------------------- | ---------------------------------------------------------- |
+| OpenAI-compatible | Top-level `model` field                       | `{"model": "gemini-2.5-flash", ...}`                       |
+| Gemini-style      | `generationConfig.model` or top-level `model` | `{"generationConfig": {"model": "gemini-2.5-flash"}, ...}` |
+
+If no model is specified in the request, the server's current default model is
+used. Manage the default model with:
+
+```bash
+# View current default model
+curl http://localhost:41242/v1/models/current -H "Authorization: Bearer root"
+
+# Change default model
+curl -X PUT http://localhost:41242/v1/models/current \
+  -H "Authorization: Bearer root" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"gemini-2.5-flash"}'
+
+# List all available models
+curl http://localhost:41242/v1/models -H "Authorization: Bearer root"
+```
 
 ## Authentication Model
 
-The API layer has its own token auth middleware.
+The API layer has its own token auth middleware, **covering both the Web console
+and API request headers**.
 
-- Default token env var: `GEMINI_PROMPT_API_TOKEN`
-- If not configured, the current fallback token is `root`
-- Browser-friendly `?token=` access is also supported
-- Open API mode can selectively bypass auth for some routes
+- Default token is `root`, customizable via `GEMINI_PROMPT_API_TOKEN`
+  environment variable
+- Pass the token via `Authorization: Bearer <token>` header
+- Browser access also accepts `?token=<token>` query parameter
+- **Open-API mode** can be enabled via the console or API to bypass auth for API
+  endpoints (the Web console still requires a token)
 
-Credential login is handled separately from API token auth.
+Token auth and Google credential login are two independent mechanisms:
+
+- **Token**: Controls who can access the API service
+- **Google credentials**: Controls which Google account is used to call Gemini
+
+## Request Settings
+
+Configure via `/v1/settings` or the management console:
+
+| Setting           | Description                                              | Default                          |
+| ----------------- | -------------------------------------------------------- | -------------------------------- |
+| `rotationEnabled` | Credential rotation (round-robin across all credentials) | `false`                          |
+| `retryEnabled`    | Auto-retry on error (not on timeout)                     | `false`                          |
+| `retryCount`      | Retry count (1-10)                                       | `3`                              |
+| `timeoutMs`       | Request timeout in ms, 0 means use default               | `0` (default: 600000ms / 10 min) |
+
+```bash
+# View current settings
+curl http://localhost:41242/v1/settings -H "Authorization: Bearer root"
+
+# Enable rotation and retry
+curl -X PUT http://localhost:41242/v1/settings \
+  -H "Authorization: Bearer root" \
+  -H "Content-Type: application/json" \
+  -d '{"rotationEnabled":true,"retryEnabled":true,"retryCount":3,"timeoutMs":120000}'
+```
 
 ## Managed Credential Flow
 
-Google account login is implemented as a two-step flow:
+Google account login uses a two-step flow:
 
-1. `POST /v1/credentials/login`
-   - Creates a login job
-   - Returns `loginId`, `authUrl`, and `redirectUri`
+1. Call `POST /v1/credentials/login` to create a login job. Returns `loginId`,
+   `authUrl`, and `redirectUri`.
+2. Open `authUrl` in a browser and complete Google authorization.
+3. Submit the localhost callback URL to
+   `POST /v1/credentials/login/:loginId/complete`.
 
-2. Complete browser login, then send the localhost callback URL to:
-   - `POST /v1/credentials/login/:loginId/complete`
+Poll login status with `GET /v1/credentials/login/:loginId`.
 
-You can poll the current login state with:
-
-- `GET /v1/credentials/login/:loginId`
-
-The currently selected credential is then used automatically for later chat
-requests, so callers do not need to send a credential ID on every request.
+After login completes, subsequent chat requests automatically use the currently
+active credential. This flow can also be completed entirely through the Web
+console.
 
 ## Quota Behavior
 
@@ -128,34 +341,24 @@ values.
 
 ## Web Console
 
-The management UI at `/manage` is designed to help with:
+The management UI at `/manage` (supports English / Chinese) provides:
 
-- token auth checks
+- Token auth login
+- Runtime token management / open-API mode toggle
 - Google credential login and completion
-- active credential switching
-- quota inspection
-- model selection
-- endpoint discovery and examples
-
-## Development
-
-Start the API server with:
-
-```bash
-npm run start:a2a-server
-```
-
-Default local address:
-
-```text
-http://localhost:41242/manage
-```
+- Active credential switching
+- Per-credential test messaging
+- Quota inspection
+- Model selection
+- Rotation, retry, and timeout configuration
 
 ## Repository Notes
 
-- The current implementation lives mainly under `packages/a2a-server/src/http`
-- Gemini and OpenAI request translation lives under
-  `packages/a2a-server/src/http/adapters`
+- Main implementation: `packages/a2a-server/src/http/promptApi.ts`
+- Auth middleware: `packages/a2a-server/src/http/promptApiAuth.ts`
+- Console page: `packages/a2a-server/src/http/promptApiConsole.ts`
+- Credential store: `packages/a2a-server/src/http/promptCredentialStore.ts`
+- Format adapters: `packages/a2a-server/src/http/adapters/`
 - The runtime still depends on Gemini CLI login state and execution behavior
 
 ## Licensing

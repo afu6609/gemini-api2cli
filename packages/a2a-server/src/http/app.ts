@@ -22,6 +22,7 @@ import type { AgentSettings } from '../types.js';
 import { GCSTaskStore, NoOpTaskStore } from '../persistence/gcs.js';
 import { CoderAgentExecutor } from '../agent/executor.js';
 import { requestStorage } from './requestStorage.js';
+import { createPromptApiRouter } from './promptApi.js';
 import { loadConfig, loadEnvironment, setTargetDir } from '../config/config.js';
 import { loadSettings } from '../config/settings.js';
 import { loadExtensions } from '../config/extension.js';
@@ -192,7 +193,31 @@ async function handleExecuteCommand(
   }
 }
 
+function registerUnavailableAgentRoutes(expressApp: express.Express) {
+  const unavailableMessage =
+    'A2A agent routes are unavailable because the server could not initialize its direct Gemini configuration. Prompt API routes under /v1 remain available and can still reuse CLI login state.';
+
+  expressApp.all(['/', '/tasks', '/executeCommand', '/listCommands'], (_req, res) => {
+    res.status(503).json({ error: unavailableMessage });
+  });
+
+  expressApp.all(['/tasks/metadata', '/tasks/:taskId/metadata'], (_req, res) => {
+    res.status(503).json({ error: unavailableMessage });
+  });
+
+  expressApp.get('/.well-known/agent-card.json', (_req, res) => {
+    res.status(503).json({ error: unavailableMessage });
+  });
+}
+
 export async function createApp() {
+  const expressApp = express();
+  expressApp.use((req, res, next) => {
+    requestStorage.run({ req }, next);
+  });
+  expressApp.use(express.json());
+  expressApp.use(createPromptApiRouter());
+
   try {
     // Load the server configuration once on startup.
     const workspaceRoot = setTargetDir(undefined);
@@ -238,14 +263,8 @@ export async function createApp() {
       agentExecutor,
     );
 
-    let expressApp = express();
-    expressApp.use((req, res, next) => {
-      requestStorage.run({ req }, next);
-    });
-
     const appBuilder = new A2AExpressApp(requestHandler, customUserBuilder);
-    expressApp = appBuilder.setupRoutes(expressApp, '');
-    expressApp.use(express.json());
+    appBuilder.setupRoutes(expressApp, '');
 
     expressApp.post('/tasks', async (req, res) => {
       try {
@@ -362,11 +381,15 @@ export async function createApp() {
       }
       res.json({ metadata: await wrapper.task.getMetadata() });
     });
-    return expressApp;
   } catch (error) {
+    logger.warn(
+      '[CoreAgent] Continuing in prompt-api-only mode because A2A initialization failed.',
+    );
     logger.error('[CoreAgent] Error during startup:', error);
-    process.exit(1);
+    registerUnavailableAgentRoutes(expressApp);
   }
+
+  return expressApp;
 }
 
 export async function main() {

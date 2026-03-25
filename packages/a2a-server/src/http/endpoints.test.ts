@@ -13,10 +13,14 @@ import * as os from 'node:os';
 import type { Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 
+// Set auth token for prompt API tests.
+process.env['GEMINI_PROMPT_API_TOKEN'] = 'test-token-for-tests';
+
 import { createApp, updateCoderAgentCardUrl } from './app.js';
 import type { TaskMetadata } from '../types.js';
 import { createMockConfig } from '../utils/testing_utils.js';
 import { debugLogger, type Config } from '@google/gemini-cli-core';
+import { loadConfig } from '../config/config.js';
 
 // Mock the logger to avoid polluting test output
 // Comment out to help debug
@@ -158,5 +162,28 @@ describe('Agent Server Endpoints', () => {
     expect(response.status).toBe(200);
     expect(response.body.name).toBe('Gemini SDLC Agent');
     expect(response.body.url).toBe(`http://localhost:${port}/`);
+  });
+
+  it('should keep prompt API routes available when A2A config initialization fails', async () => {
+    const mockedLoadConfig = vi.mocked(loadConfig);
+    mockedLoadConfig.mockRejectedValueOnce(
+      new Error('Missing direct auth for A2A startup'),
+    );
+
+    const degradedApp = await createApp();
+
+    const healthResponse = await request(degradedApp)
+      .get('/v1/health')
+      .set('Authorization', 'Bearer test-token-for-tests');
+    expect(healthResponse.status).toBe(200);
+    expect(healthResponse.body.ok).toBe(true);
+
+    const unavailableResponse = await request(degradedApp).get(
+      '/.well-known/agent-card.json',
+    );
+    expect(unavailableResponse.status).toBe(503);
+    expect(unavailableResponse.body.error).toContain(
+      'Prompt API routes under /v1 remain available',
+    );
   });
 });

@@ -1,0 +1,14 @@
+FROM node:20-slim
+WORKDIR /app
+COPY package.json package-lock.json ./
+COPY packages/core/package.json packages/core/
+COPY packages/cli/package.json packages/cli/
+COPY packages/a2a-server/package.json packages/a2a-server/
+RUN npm install --workspace @google/gemini-cli-core --workspace @google/gemini-cli --workspace @google/gemini-cli-a2a-server --ignore-scripts
+COPY packages/core/dist/ packages/core/dist/
+COPY packages/core/index.ts packages/core/
+COPY packages/cli/dist/ packages/cli/dist/
+COPY packages/a2a-server/dist/ packages/a2a-server/dist/
+EXPOSE 41242
+ENV CODER_AGENT_PORT=41242
+CMD ["node", "packages/a2a-server/dist/src/http/server.js"]

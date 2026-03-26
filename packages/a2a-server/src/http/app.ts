@@ -403,7 +403,8 @@ export async function main() {
     const expressApp = await createApp();
     const port = Number(process.env['CODER_AGENT_PORT'] || 0);
 
-    const server = expressApp.listen(port, 'localhost', () => {
+    const host = process.env['CODER_AGENT_HOST'] || '0.0.0.0';
+    const server = expressApp.listen(port, host, () => {
       const address = server.address();
       let actualPort;
       if (process.env['CODER_AGENT_PORT']) {

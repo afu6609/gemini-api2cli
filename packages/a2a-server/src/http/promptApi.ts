@@ -1208,6 +1208,11 @@ async function runSingleJsonInvocation(
 
   try {
     const [exitCode] = await Promise.all([waitForChildExit(child), stdoutDone]);
+    if (exitCode !== 0 && _stderrOutput.trim().length > 0) {
+      logger.error(
+        `[Prompt API] CLI stderr (exit ${String(exitCode)}): ${_stderrOutput.trim()}`,
+      );
+    }
     return { assistantText, exitCode, didTimeout: invocation.didTimeout() };
   } finally {
     await invocation.cleanup();
@@ -1853,7 +1858,6 @@ export function createPromptApiRouter(
 
   const googleAiStudioGenerateHandler = async (req: Request, res: Response) => {
     try {
-       
       const params = req.params as Record<string, string>;
       const model = params['model'];
       const action = params['action'];

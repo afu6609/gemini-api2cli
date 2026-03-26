@@ -32,9 +32,14 @@ package names still refer to `gemini-cli` or `a2a-server`.
 ### Local Setup
 
 ```bash
+git clone https://github.com/nicekid1/gemini-api2cli.git
+cd gemini-api2cli
 npm install
 npm run start:a2a-server
 ```
+
+`start:a2a-server` automatically builds `core` → `a2a-server` workspaces in
+sequence, then starts the service.
 
 Then open the management console:
 
@@ -47,31 +52,75 @@ On first visit you will need to enter a token. The default is `root`
 
 ### Environment Variables
 
-| Variable                  | Description          | Default |
-| ------------------------- | -------------------- | ------- |
-| `GEMINI_PROMPT_API_TOKEN` | API / Web auth token | `root`  |
-| `CODER_AGENT_PORT`        | Server listen port   | `41242` |
+| Variable                  | Description          | Default   |
+| ------------------------- | -------------------- | --------- |
+| `GEMINI_PROMPT_API_TOKEN` | API / Web auth token | `root`    |
+| `CODER_AGENT_PORT`        | Server listen port   | `41242`   |
+| `CODER_AGENT_HOST`        | Server bind address  | `0.0.0.0` |
 
 ### Docker Deployment
 
+#### 1. Clone and build locally
+
 ```bash
-docker build -t gemini-api2cli .
+git clone https://github.com/nicekid1/gemini-api2cli.git
+cd gemini-api2cli
+npm install
+npm run build --workspace @google/gemini-cli-core
+npm run build --workspace @google/gemini-cli
+npm run build --workspace @google/gemini-cli-a2a-server
+```
+
+> TypeScript compilation is memory-intensive. Build locally first, then package
+> the artifacts into a Docker image.
+
+#### 2. Build image and start
+
+```bash
+docker build -f Dockerfile.a2a -t gemini-api2cli .
 docker run -d -p 41242:41242 \
   -e GEMINI_PROMPT_API_TOKEN=your_token \
+  --name gemini-api2cli \
   gemini-api2cli
 ```
 
-If no Dockerfile exists, use this as a starting point:
+#### Appendix: `Dockerfile.a2a`
+
+The `Dockerfile` in the repository is for the upstream Gemini CLI image and does
+not include the API service. Use `Dockerfile.a2a` for the API service. It only
+installs runtime dependencies and copies pre-built artifacts (no compilation
+inside the container):
 
 ```dockerfile
 FROM node:20-slim
 WORKDIR /app
-COPY . .
-RUN npm install && npm run build --workspace @google/gemini-cli-core && npm run build --workspace @google/gemini-cli-a2a-server
+COPY package.json package-lock.json ./
+COPY packages/core/package.json packages/core/
+COPY packages/cli/package.json packages/cli/
+COPY packages/a2a-server/package.json packages/a2a-server/
+RUN npm install --workspace @google/gemini-cli-core --workspace @google/gemini-cli --workspace @google/gemini-cli-a2a-server --ignore-scripts
+COPY packages/core/dist/ packages/core/dist/
+COPY packages/core/index.ts packages/core/
+COPY packages/cli/dist/ packages/cli/dist/
+COPY packages/a2a-server/dist/ packages/a2a-server/dist/
 EXPOSE 41242
 ENV CODER_AGENT_PORT=41242
-CMD ["npm", "run", "start", "--workspace", "@google/gemini-cli-a2a-server"]
+CMD ["node", "packages/a2a-server/dist/src/http/server.js"]
 ```
+
+> **Important**: The container has no Google credentials by default. Mount your
+> host credential directory:
+>
+> ```bash
+> # Linux / macOS
+> docker run ... -v ~/.gemini:/root/.gemini ...
+>
+> # Windows PowerShell
+> docker run ... -v ${env:USERPROFILE}\.gemini:/root/.gemini ...
+> ```
+>
+> This lets the container use your locally logged-in Google credentials.
+> Alternatively, log in via the management console at `/manage` after starting.
 
 ## Endpoints
 

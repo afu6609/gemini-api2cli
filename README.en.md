@@ -139,6 +139,17 @@ CMD ["npm", "run", "start", "--workspace", "@google/gemini-cli-a2a-server"]
 | ------ | ----------------------------- | ------------------------------------------ |
 | POST   | `/v1/openai/chat/completions` | Chat Completions (supports `stream: true`) |
 
+### Google AI Studio Compatible Endpoints (SillyTavern & other clients)
+
+All paths below also work with `/v1/models/`, `/v1beta/models/`, and
+`/v1/v1beta/models/` prefixes:
+
+| Method | Path                                           | Description                        |
+| ------ | ---------------------------------------------- | ---------------------------------- |
+| GET    | `/v1beta/models`                               | Model list (AI Studio format)      |
+| POST   | `/v1beta/models/{model}:generateContent`       | Non-streaming (model name in path) |
+| POST   | `/v1beta/models/{model}:streamGenerateContent` | SSE streaming (model name in path) |
+
 ## Usage Examples
 
 All examples below assume the service is running at `localhost:41242` with token
@@ -282,6 +293,9 @@ and API request headers**.
 - Default token is `root`, customizable via `GEMINI_PROMPT_API_TOKEN`
   environment variable
 - Pass the token via `Authorization: Bearer <token>` header
+- Also accepts `x-goog-api-key: <token>` header (SillyTavern and other
+  third-party clients)
+- Also accepts `?key=<token>` query parameter (Google AI Studio style)
 - Browser access also accepts `?token=<token>` query parameter
 - **Open-API mode** can be enabled via the console or API to bypass auth for API
   endpoints (the Web console still requires a token)
@@ -350,6 +364,25 @@ The management UI at `/manage` (supports English / Chinese) provides:
 - Quota inspection
 - Model selection
 - Rotation, retry, and timeout configuration
+
+## SillyTavern Integration
+
+This project is compatible with SillyTavern's MakerSuite / Gemini reverse proxy
+mode.
+
+### Setup
+
+1. In SillyTavern, select **API type**: `MakerSuite` (Google AI Studio)
+2. Set **Reverse Proxy** to: `http://localhost:41242` (without `/v1` suffix)
+3. Set **Proxy Password** to your token (default `root`)
+4. Enter any model name, e.g. `gemini-3-pro-preview`
+
+SillyTavern automatically appends `/v1beta/models/{model}:generateContent` to
+the reverse proxy URL. The server correctly routes these requests and extracts
+the model name from the path. Auth is handled via the `x-goog-api-key` header.
+
+> If your reverse proxy URL includes `/v1` (i.e. `http://localhost:41242/v1`),
+> the request path becomes `/v1/v1beta/models/...`, which is also supported.
 
 ## Repository Notes
 

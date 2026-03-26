@@ -68,6 +68,8 @@ const API_PATH_PREFIXES = [
   '/v1/models',
   '/v1/health',
   '/v1/settings',
+  '/v1beta/models',
+  '/v1/v1beta/models',
 ];
 
 export function promptApiAuthMiddleware(
@@ -75,8 +77,12 @@ export function promptApiAuthMiddleware(
   res: Response,
   next: NextFunction,
 ): void {
-  // Only gate /v1/* and /manage paths
-  if (!req.path.startsWith('/v1/') && req.path !== '/manage') {
+  // Only gate /v1/*, /v1beta/* and /manage paths
+  if (
+    !req.path.startsWith('/v1/') &&
+    !req.path.startsWith('/v1beta/') &&
+    req.path !== '/manage'
+  ) {
     next();
     return;
   }
@@ -102,6 +108,19 @@ export function promptApiAuthMiddleware(
       next();
       return;
     }
+  }
+
+  // Accept x-goog-api-key header (used by SillyTavern MakerSuite reverse proxy)
+  const apiKeyHeader = req.headers['x-goog-api-key'];
+  if (typeof apiKeyHeader === 'string' && apiKeyHeader === token) {
+    next();
+    return;
+  }
+
+  // Accept ?key= query parameter (Google AI Studio style)
+  if (req.query['key'] === token) {
+    next();
+    return;
   }
 
   // Also accept ?token= query parameter (for simple browser access)

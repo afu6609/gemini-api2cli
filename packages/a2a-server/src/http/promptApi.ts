@@ -1842,6 +1842,100 @@ export function createPromptApiRouter(
     }
   });
 
+  // ── Google AI Studio style routes (SillyTavern compatibility) ──
+  // SillyTavern appends /v1beta/models/{model}:action to the reverse proxy URL.
+  // Depending on whether the user sets the proxy to http://host:port or
+  // http://host:port/v1, the actual path can be:
+  //   /v1beta/models/{model}:generateContent
+  //   /v1/v1beta/models/{model}:generateContent
+  //   /v1/models/{model}:generateContent   (kept for direct curl usage)
+  // We also serve GET .../models for the model-list preflight SillyTavern does.
+
+  const googleAiStudioGenerateHandler = async (req: Request, res: Response) => {
+    try {
+       
+      const params = req.params as Record<string, string>;
+      const model = params['model'];
+      const action = params['action'];
+
+      // Inject the model from path into the request body for the adapter
+      if (typeof req.body === 'object' && req.body !== null) {
+        if (!req.body.model && !req.body.generationConfig?.model) {
+          req.body.model = model;
+        }
+      }
+
+      if (action === 'generateContent') {
+        return await handleAdaptedJsonRequest(
+          req,
+          res,
+          geminiAdapter,
+          deps,
+          state,
+        );
+      } else if (action === 'streamGenerateContent') {
+        return await handleAdaptedStreamingRequest(
+          req,
+          res,
+          geminiAdapter,
+          deps,
+          state,
+        );
+      } else {
+        return res.status(400).json({ error: `Unsupported action: ${action}` });
+      }
+    } catch (error) {
+      if (error instanceof BadRequestError) {
+        return res
+          .status(400)
+          .json(
+            geminiAdapter.buildJsonError(
+              error.message,
+              400,
+              state.currentModel,
+              '',
+            ),
+          );
+      }
+      logPromptApiError(error);
+      return res
+        .status(500)
+        .json(
+          geminiAdapter.buildJsonError(
+            error instanceof Error ? error.message : 'Unknown error',
+            500,
+            state.currentModel,
+            '',
+          ),
+        );
+    }
+  };
+
+  // Google AI Studio style model list (SillyTavern preflight)
+  const googleAiStudioModelsHandler = (_req: Request, res: Response) => {
+    const modelOptions = getPromptApiModelsPayload(state);
+    // Return in Google AI Studio format
+    res.status(200).json({
+      models: (modelOptions.models ?? []).map((m: PromptApiModelOption) => ({
+        name: `models/${m.id}`,
+        displayName: m.label,
+        supportedGenerationMethods: [
+          'generateContent',
+          'streamGenerateContent',
+        ],
+      })),
+    });
+  };
+
+  // Register generate handler on all path variants
+  for (const prefix of ['/v1/models', '/v1beta/models', '/v1/v1beta/models']) {
+    router.post(`${prefix}/:model\\::action`, googleAiStudioGenerateHandler);
+  }
+  // Google AI Studio model list — only on /v1beta paths (SillyTavern preflight).
+  // /v1/models is already registered above with the management console format.
+  router.get('/v1beta/models', googleAiStudioModelsHandler);
+  router.get('/v1/v1beta/models', googleAiStudioModelsHandler);
+
   // ── Token management ──
   router.put('/v1/auth/token', (req, res) => {
     try {

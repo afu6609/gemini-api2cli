@@ -221,7 +221,7 @@ export async function createApp() {
   expressApp.use((req, res, next) => {
     requestStorage.run({ req }, next);
   });
-  expressApp.use(express.json());
+  expressApp.use(express.json({ limit: '200mb' }));
   expressApp.use(createPromptApiRouter());
 
   try {

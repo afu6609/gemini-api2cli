@@ -228,6 +228,9 @@ type PromptApiSettings = {
   retryEnabled: boolean;
   retryCount: number;
   timeoutMs: number;
+  mcpEnabled: boolean;
+  extensionsEnabled: boolean;
+  skillsEnabled: boolean;
 };
 
 type PromptApiState = {
@@ -341,6 +344,7 @@ async function copyFileIfExists(
 function buildIsolatedChildEnv(
   isolatedHomeDir: string,
   promptPath: string | undefined,
+  settings: PromptApiSettings,
 ): NodeJS.ProcessEnv {
   const env = { ...process.env };
   for (const key of STRIPPED_CHILD_ENV_KEYS) {
@@ -354,6 +358,17 @@ function buildIsolatedChildEnv(
 
   if (promptPath) {
     env['GEMINI_SYSTEM_MD'] = promptPath;
+  }
+
+  // Pass lite-mode flags to CLI child process
+  if (!settings.mcpEnabled) {
+    env['GEMINI_MCP_DISABLED'] = 'true';
+  }
+  if (!settings.extensionsEnabled) {
+    env['GEMINI_EXTENSIONS_DISABLED'] = 'true';
+  }
+  if (!settings.skillsEnabled) {
+    env['GEMINI_SKILLS_DISABLED'] = 'true';
   }
 
   return env;
@@ -413,10 +428,13 @@ function createPromptApiState(credentialStoreRoot?: string): PromptApiState {
     credentialStore: new PromptCredentialStore(credentialStoreRoot),
     loginJobs: new Map(),
     settings: {
-      rotationEnabled: false,
-      retryEnabled: false,
-      retryCount: 1,
+      rotationEnabled: true,
+      retryEnabled: true,
+      retryCount: 3,
       timeoutMs: 0,
+      mcpEnabled: false,
+      extensionsEnabled: false,
+      skillsEnabled: false,
     },
     rotationIndex: 0,
   };
@@ -840,12 +858,14 @@ async function startPromptInvocation(
     '--no-warnings=DEP0040',
     deps.cliEntryPath,
     '--prompt',
-    requestBody.prompt,
+    '',
     '--output-format',
     'stream-json',
   ];
 
   args.push('--model', normalizeRequestedModel(requestBody.model, state));
+
+  logger.info(`[Prompt API] Prompt length: ${requestBody.prompt.length} chars`);
 
   let child: ChildProcessWithoutNullStreams | undefined;
   let didTimeout = false;
@@ -858,9 +878,15 @@ async function startPromptInvocation(
       env: buildIsolatedChildEnv(
         promptOverride.homeDir,
         promptOverride.filePath,
+        state.settings,
       ),
       stdio: ['pipe', 'pipe', 'pipe'],
     }) as unknown as ChildProcessWithoutNullStreams;
+
+    // Feed prompt via stdin to avoid ENAMETOOLONG on long conversations.
+    // CLI reads stdin when !process.stdin.isTTY and prepends it to --prompt.
+    child.stdin.write(requestBody.prompt);
+    child.stdin.end();
 
     child.stdout.setEncoding('utf8');
     child.stderr.setEncoding('utf8');
@@ -1450,6 +1476,15 @@ export function createPromptApiRouter(
           );
         }
         state.settings.timeoutMs = Math.floor(n);
+      }
+      if (b['mcpEnabled'] !== undefined) {
+        state.settings.mcpEnabled = Boolean(b['mcpEnabled']);
+      }
+      if (b['extensionsEnabled'] !== undefined) {
+        state.settings.extensionsEnabled = Boolean(b['extensionsEnabled']);
+      }
+      if (b['skillsEnabled'] !== undefined) {
+        state.settings.skillsEnabled = Boolean(b['skillsEnabled']);
       }
       return res
         .status(200)

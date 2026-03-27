@@ -32,7 +32,7 @@ package names still refer to `gemini-cli` or `a2a-server`.
 ### Local Setup
 
 ```bash
-git clone https://github.com/nicekid1/gemini-api2cli.git
+git clone https://github.com/afu6609/gemini-api2cli
 cd gemini-api2cli
 npm install
 npm run start:a2a-server
@@ -63,7 +63,7 @@ On first visit you will need to enter a token. The default is `root`
 #### 1. Clone and build locally
 
 ```bash
-git clone https://github.com/nicekid1/gemini-api2cli.git
+git clone https://github.com/afu6609/gemini-api2cli
 cd gemini-api2cli
 npm install
 npm run build --workspace @google/gemini-cli-core

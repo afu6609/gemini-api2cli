@@ -40,6 +40,9 @@ a{color:var(--accent);text-decoration:none}
 .auth-input::placeholder{color:var(--text3)}
 .auth-btn{width:100%;margin-top:16px;padding:12px;background:var(--accent2);color:#fff;border:0;border-radius:var(--radius);font:600 14px var(--sans);cursor:pointer;transition:background .15s}
 .auth-btn:hover{background:var(--accent)}
+.auth-btn:disabled{opacity:.7;cursor:not-allowed}
+.auth-btn .spinner{display:inline-block;width:14px;height:14px;border:2px solid rgba(255,255,255,.3);border-top-color:#fff;border-radius:50%;animation:spin .6s linear infinite;vertical-align:middle;margin-right:6px}
+@keyframes spin{to{transform:rotate(360deg)}}
 .auth-error{margin-top:12px;color:var(--red);font-size:13px;min-height:20px}
 
 /* ── Shell ── */
@@ -337,6 +340,24 @@ a{color:var(--accent);text-decoration:none}
             <option value="4">4</option><option value="5">5</option>
           </select>
         </div>
+        <div style="border-top:1px solid var(--border);margin:4px 0 8px;padding-top:8px">
+          <div style="font-size:12px;color:var(--text3);margin-bottom:8px" id="t-cli-init-title">CLI Initialization (disabling speeds up cold start)</div>
+          <label class="toggle-row">
+            <input type="checkbox" id="mcp-toggle"/>
+            <span id="t-mcp-label">MCP Servers</span>
+            <span class="toggle-hint" id="t-mcp-hint">Start MCP servers in CLI subprocess</span>
+          </label>
+          <label class="toggle-row">
+            <input type="checkbox" id="extensions-toggle"/>
+            <span id="t-extensions-label">Extensions</span>
+            <span class="toggle-hint" id="t-extensions-hint">Load extensions in CLI subprocess</span>
+          </label>
+          <label class="toggle-row">
+            <input type="checkbox" id="skills-toggle"/>
+            <span id="t-skills-label">Skills</span>
+            <span class="toggle-hint" id="t-skills-hint">Enable skill discovery in CLI subprocess</span>
+          </label>
+        </div>
         <div class="field">
           <span class="label" id="t-timeout-label">Timeout (seconds)</span>
           <div class="row" style="gap:8px;align-items:center">
@@ -388,6 +409,7 @@ const I = {
     authSubtitle: 'Prompt API Management Console',
     authPlaceholder: 'Enter access token',
     authSignIn: 'Sign In',
+    authSigningIn: 'Signing in...',
     authEmpty: 'Please enter a token.',
     authInvalid: 'Invalid token.',
     authConnErr: 'Connection error: ',
@@ -465,6 +487,13 @@ const I = {
     timeoutLabel: 'Timeout (seconds)',
     timeoutHint: '0 = use default',
     settingsSaved: 'Settings saved.',
+    cliInitTitle: 'CLI Initialization (disabling speeds up cold start)',
+    mcpLabel: 'MCP Servers',
+    mcpHint: 'Start MCP servers in CLI subprocess',
+    extensionsLabel: 'Extensions',
+    extensionsHint: 'Load extensions in CLI subprocess',
+    skillsLabel: 'Skills',
+    skillsHint: 'Enable skill discovery in CLI subprocess',
     epGeminiGen: 'Gemini native non-streaming. Request/response in Gemini API format.',
     epGeminiStream: 'Gemini native streaming (SSE). Request in Gemini API format.',
     epOpenai: 'OpenAI-compatible chat completions. Set "stream":true for SSE streaming.',
@@ -489,6 +518,7 @@ const I = {
     authSubtitle: 'Prompt API 管理控制台',
     authPlaceholder: '请输入访问令牌',
     authSignIn: '登录',
+    authSigningIn: '登录中...',
     authEmpty: '请输入令牌。',
     authInvalid: '令牌无效。',
     authConnErr: '连接错误：',
@@ -566,6 +596,13 @@ const I = {
     timeoutLabel: '超时时间（秒）',
     timeoutHint: '0 = 使用默认值',
     settingsSaved: '设置已保存。',
+    cliInitTitle: 'CLI 初始化项（关闭可加快冷启动速度）',
+    mcpLabel: 'MCP 服务器',
+    mcpHint: '在 CLI 子进程中启动 MCP 服务器',
+    extensionsLabel: '扩展',
+    extensionsHint: '在 CLI 子进程中加载扩展',
+    skillsLabel: '技能',
+    skillsHint: '在 CLI 子进程中启用技能发现',
     epGeminiGen: 'Gemini 原生非流式接口，请求/响应均为 Gemini API 格式。',
     epGeminiStream: 'Gemini 原生流式接口 (SSE)，请求为 Gemini API 格式。',
     epOpenai: 'OpenAI 兼容聊天补全接口，设置 "stream":true 开启 SSE 流式。',
@@ -597,7 +634,7 @@ function applyLang() {
   // Auth screen
   $('auth-subtitle').textContent = t('authSubtitle');
   $('token-input').placeholder = t('authPlaceholder');
-  $('auth-submit').textContent = t('authSignIn');
+  if (!$('auth-submit').disabled) $('auth-submit').textContent = t('authSignIn');
   // Header
   $('refresh-all-btn').textContent = t('refreshAll');
   $('logout-btn').textContent = t('signOut');
@@ -651,6 +688,13 @@ function applyLang() {
   $('t-retry-label').textContent = t('retryLabel');
   $('t-retry-hint').textContent = t('retryHint');
   $('t-retry-count-label').textContent = t('retryCountLabel');
+  $('t-cli-init-title').textContent = t('cliInitTitle');
+  $('t-mcp-label').textContent = t('mcpLabel');
+  $('t-mcp-hint').textContent = t('mcpHint');
+  $('t-extensions-label').textContent = t('extensionsLabel');
+  $('t-extensions-hint').textContent = t('extensionsHint');
+  $('t-skills-label').textContent = t('skillsLabel');
+  $('t-skills-hint').textContent = t('skillsHint');
   $('t-timeout-label').textContent = t('timeoutLabel');
   $('t-timeout-hint').textContent = t('timeoutHint');
   $('save-settings-btn').textContent = t('save');
@@ -674,10 +718,11 @@ $('lang-btn').onclick = () => {
 };
 
 /* ── Auth ── */
-function showApp() {
+async function showApp() {
+  // Pre-load data before switching screens so the spinner stays visible
+  await boot();
   $('auth-screen').style.display = 'none';
   $('app').style.display = 'block';
-  boot();
 }
 
 async function tryAuth(token) {
@@ -690,17 +735,25 @@ async function tryAuth(token) {
 $('auth-submit').onclick = async () => {
   const token = $('token-input').value.trim();
   if (!token) { $('auth-error').textContent = t('authEmpty'); return; }
+  const btn = $('auth-submit');
+  const origText = btn.textContent;
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span>' + t('authSigningIn');
+  $('auth-error').textContent = '';
   try {
     if (await tryAuth(token)) {
       S.token = token;
       localStorage.setItem(TOKEN_KEY, token);
       $('auth-error').textContent = '';
-      showApp();
+      await showApp();
     } else {
       $('auth-error').textContent = t('authInvalid');
     }
   } catch (e) {
     $('auth-error').textContent = t('authConnErr') + e.message;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = origText;
   }
 };
 
@@ -1084,8 +1137,8 @@ $('change-token-btn').onclick = async () => {
     // Re-enter the app with the new token
     $('auth-screen').style.display = 'flex';
     $('app').style.display = 'none';
-    tryAuth(newToken).then(ok => {
-      if (ok) showApp();
+    tryAuth(newToken).then(async ok => {
+      if (ok) await showApp();
     });
   } catch(e) { showErr(e); }
 };
@@ -1113,6 +1166,9 @@ $('save-settings-btn').onclick = async () => {
         retryEnabled: $('retry-toggle').checked,
         retryCount: parseInt($('retry-count-select').value, 10),
         timeoutMs: Math.floor(timeoutSec * 1000),
+        mcpEnabled: $('mcp-toggle').checked,
+        extensionsEnabled: $('extensions-toggle').checked,
+        skillsEnabled: $('skills-toggle').checked,
       }),
     });
     $('settings-meta').textContent = t('settingsSaved');
@@ -1128,6 +1184,9 @@ async function loadSettings() {
     $('retry-toggle').checked = !!s.retryEnabled;
     $('retry-count-select').value = String(s.retryCount || 3);
     $('retry-count-row').style.display = s.retryEnabled ? '' : 'none';
+    $('mcp-toggle').checked = !!s.mcpEnabled;
+    $('extensions-toggle').checked = !!s.extensionsEnabled;
+    $('skills-toggle').checked = !!s.skillsEnabled;
     const timeoutSec = (s.timeoutMs || 0) / 1000;
     $('timeout-input').value = timeoutSec > 0 ? String(timeoutSec) : '0';
     const defSec = p.defaultTimeoutMs ? (p.defaultTimeoutMs / 1000) : 600;
@@ -1151,13 +1210,19 @@ applyLang();
 
 // Auto-login if token exists in localStorage
 if (S.token) {
-  tryAuth(S.token).then(ok => {
-    if (ok) showApp();
+  const btn = $('auth-submit');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span>' + t('authSigningIn');
+  tryAuth(S.token).then(async ok => {
+    if (ok) { await showApp(); }
     else {
       localStorage.removeItem(TOKEN_KEY);
       S.token = '';
     }
-  }).catch(() => {});
+  }).catch(() => {}).finally(() => {
+    btn.disabled = false;
+    btn.textContent = t('authSignIn');
+  });
 }
 </script>
 </body>

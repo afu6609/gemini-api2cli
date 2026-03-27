@@ -727,9 +727,18 @@ export async function loadCliConfig(
 
   const ptyInfo = await getPty();
 
-  const mcpEnabled = settings.admin?.mcp?.enabled ?? true;
-  const extensionsEnabled = settings.admin?.extensions?.enabled ?? true;
-  const adminSkillsEnabled = settings.admin?.skills?.enabled ?? true;
+  const mcpEnabled =
+    process.env['GEMINI_MCP_DISABLED'] === 'true'
+      ? false
+      : (settings.admin?.mcp?.enabled ?? true);
+  const extensionsEnabled =
+    process.env['GEMINI_EXTENSIONS_DISABLED'] === 'true'
+      ? false
+      : (settings.admin?.extensions?.enabled ?? true);
+  const adminSkillsEnabled =
+    process.env['GEMINI_SKILLS_DISABLED'] === 'true'
+      ? false
+      : (settings.admin?.skills?.enabled ?? true);
 
   // Create MCP enablement manager and callbacks
   const mcpEnablementManager = McpServerEnablementManager.getInstance();
@@ -873,7 +882,10 @@ export async function loadCliConfig(
       ? settings.general.plan
       : (extensionPlanSettings ?? settings.general?.plan),
     enableEventDrivenScheduler: true,
-    skillsSupport: settings.skills?.enabled ?? true,
+    skillsSupport:
+      process.env['GEMINI_SKILLS_DISABLED'] === 'true'
+        ? false
+        : (settings.skills?.enabled ?? true),
     disabledSkills: settings.skills?.disabled,
     experimentalJitContext: settings.experimental?.jitContext,
     experimentalMemoryManager: settings.experimental?.memoryManager,

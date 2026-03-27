@@ -326,6 +326,7 @@ export default tseslint.config(
       'packages/a2a-server/src/http/promptApiAuth.ts',
       'packages/a2a-server/src/http/promptApiConsole.ts',
       'packages/a2a-server/src/http/promptCredentialStore.ts',
+      'packages/a2a-server/src/http/acpProcessPool.ts',
       'packages/a2a-server/src/http/adapters/*.ts',
     ],
     rules: {

@@ -351,22 +351,9 @@ export class AcpWorker {
         onDone: () => {
           // Will be resolved by the prompt() return
         },
-        onError: (err) => {
+        onError: (err: Error) => {
           this.promptListeners.delete(sessionId);
-          reject(
-            err instanceof Error
-              ? err
-              : new Error(
-                  typeof err === 'string'
-                    ? err
-                    : typeof err === 'object' &&
-                        err !== null &&
-                        typeof (err as Record<string, unknown>)['message'] ===
-                          'string'
-                      ? String((err as Record<string, unknown>)['message'])
-                      : JSON.stringify(err),
-                ),
-          );
+          reject(err);
         },
       });
 
@@ -379,9 +366,23 @@ export class AcpWorker {
           this.touchActivity();
           resolve(response);
         })
-        .catch((err) => {
+        .catch((err: unknown) => {
           this.promptListeners.delete(sessionId);
-          reject(err instanceof Error ? err : new Error(String(err)));
+          let msg: string;
+          if (err instanceof Error) {
+            reject(err);
+            return;
+          }
+          if (typeof err === 'string') {
+            msg = err;
+          } else {
+            try {
+              msg = JSON.stringify(err);
+            } catch {
+              msg = String(err);
+            }
+          }
+          reject(new Error(msg));
         });
     });
   }

@@ -353,7 +353,20 @@ export class AcpWorker {
         },
         onError: (err) => {
           this.promptListeners.delete(sessionId);
-          reject(err);
+          reject(
+            err instanceof Error
+              ? err
+              : new Error(
+                  typeof err === 'string'
+                    ? err
+                    : typeof err === 'object' &&
+                        err !== null &&
+                        typeof (err as Record<string, unknown>)['message'] ===
+                          'string'
+                      ? String((err as Record<string, unknown>)['message'])
+                      : JSON.stringify(err),
+                ),
+          );
         },
       });
 

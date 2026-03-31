@@ -373,13 +373,22 @@ a{color:var(--accent);text-decoration:none}
           </div>
         </div>
         <div style="border-top:1px solid var(--border);margin:4px 0 8px;padding-top:8px">
-          <div style="font-size:12px;color:var(--text3);margin-bottom:8px" id="t-acp-title">ACP Mode (experimental)</div>
-          <label class="toggle-row">
-            <input type="checkbox" id="acp-toggle"/>
-            <span id="t-acp-label">Enable ACP Mode</span>
-            <span class="toggle-hint" id="t-acp-hint">Keep CLI processes alive, reduce cold start, enable sessions</span>
-          </label>
-          <div class="field" id="acp-idle-row" style="display:none">
+          <div style="font-size:12px;color:var(--text3);margin-bottom:8px" id="t-worker-title">Worker Process Settings</div>
+          <div class="field">
+            <span class="label" id="t-max-workers-label">Max Workers</span>
+            <div class="row" style="gap:8px;align-items:center">
+              <input type="number" id="max-workers-input" class="input" style="width:100px" min="0" step="1" value="0"/>
+              <span class="toggle-hint" id="t-max-workers-hint" style="margin-left:0">0 = unlimited</span>
+            </div>
+          </div>
+          <div class="field">
+            <span class="label" id="t-failover-workers-label">Failover Workers</span>
+            <div class="row" style="gap:8px;align-items:center">
+              <input type="number" id="failover-workers-input" class="input" style="width:100px" min="0" step="1" value="0"/>
+              <span class="toggle-hint" id="t-failover-workers-hint" style="margin-left:0">Standby workers for instant credential failover</span>
+            </div>
+          </div>
+          <div class="field">
             <span class="label" id="t-acp-idle-label">Idle Timeout (seconds)</span>
             <div class="row" style="gap:8px;align-items:center">
               <input type="number" id="acp-idle-input" class="input" style="width:100px" min="0" step="30" value="300"/>
@@ -395,7 +404,7 @@ a{color:var(--accent);text-decoration:none}
     </div>
 
     <!-- ACP Sessions -->
-    <div class="card" id="acp-sessions-card" style="display:none">
+    <div class="card" id="acp-sessions-card">
       <div class="card-title" id="t-acp-sessions">ACP Sessions</div>
       <div class="card-desc" id="t-acp-sessions-desc">Manage active ACP sessions and worker processes.</div>
       <div id="acp-sessions-list" style="font-size:13px;color:var(--text2)"></div>
@@ -432,6 +441,7 @@ const S = {
   lastModels: null,
   lastCreds: null,
   lastQuotas: null,
+  lastSettings: null,
 };
 
 const $ = id => document.getElementById(id);
@@ -492,8 +502,8 @@ const I = {
     loadingQuota: 'Loading quota for ',
     credentialColon: 'Credential: ',
     sessionExpired: 'Session expired.',
-    health: 'Health', cli: 'CLI', context: 'Context', model: 'Model', credential: 'Credential',
-    ok: 'OK', error: 'Error', built: 'Built', notBuilt: 'Not Built', isolated: 'Isolated', unknown: 'Unknown', none: 'None',
+    health: 'Health', cli: 'CLI', context: 'Context', model: 'Model', credential: 'Credential', acp: 'ACP',
+    ok: 'OK', error: 'Error', built: 'Built', notBuilt: 'Not Built', isolated: 'Isolated', unknown: 'Unknown', none: 'None', on: 'On', off: 'Off',
     remaining: 'Remaining', numeric: 'Numeric', plan: 'Plan', credits: 'Credits', reset: 'Reset', models: 'Models',
     statusOk: 'OK', statusNotLoggedIn: 'Not Logged In', statusError: 'Error',
     tokenMgmt: 'Token Management',
@@ -506,10 +516,12 @@ const I = {
     changeToken: 'Change Token',
     tokenChanged: 'Token changed. Please re-login with the new token.',
     tokenEmpty: 'Please enter a token.',
-    testSuccess: 'OK — Response received.',
+    testSuccess: 'OK — Request succeeded.',
     testing: 'Testing...',
+    startingLogin: 'Starting...',
+    completingLogin: 'Completing...',
     testCredBtn: 'Test',
-    testCredTip: 'Send a test message using this credential.',
+    testCredTip: 'Send a real request to verify this credential works.',
     reqSettings: 'Request Settings',
     reqSettingsDesc: 'Configure credential rotation and error retry behavior.',
     rotationLabel: 'Credential Rotation',
@@ -530,10 +542,12 @@ const I = {
     proxyLabel: 'Proxy',
     proxyHint: 'Leave empty to disable',
     proxyPlaceholder: 'http://127.0.0.1:7890',
-    acpTitle: 'ACP Mode (experimental)',
-    acpLabel: 'Enable ACP Mode',
-    acpHint: 'Keep CLI processes alive, reduce cold start, enable sessions',
-    acpIdleLabel: 'Idle Timeout (seconds)',
+    workerTitle: 'Worker Process Settings',
+    maxWorkersLabel: 'Max Workers',
+    maxWorkersHint: '0 = unlimited',
+    failoverWorkersLabel: 'Failover Workers',
+    failoverWorkersHint: 'Standby workers for instant credential failover',
+    acpIdleLabel: 'Worker Idle Timeout (seconds)',
     acpIdleHint: '0 = never timeout',
     acpSessions: 'ACP Sessions',
     acpSessionsDesc: 'Manage active ACP sessions and worker processes.',
@@ -617,8 +631,8 @@ const I = {
     loadingQuota: '正在加载额度：',
     credentialColon: '凭据：',
     sessionExpired: '会话已过期。',
-    health: '健康状态', cli: 'CLI', context: '上下文', model: '模型', credential: '凭据',
-    ok: '正常', error: '异常', built: '已构建', notBuilt: '未构建', isolated: '隔离', unknown: '未知', none: '无',
+    health: '健康状态', cli: 'CLI', context: '上下文', model: '模型', credential: '凭据', acp: 'ACP',
+    ok: '正常', error: '异常', built: '已构建', notBuilt: '未构建', isolated: '隔离', unknown: '未知', none: '无', on: '已启用', off: '已关闭',
     remaining: '剩余比例', numeric: '数值额度', plan: '套餐', credits: '积分', reset: '重置时间', models: '模型数',
     statusOk: '正常', statusNotLoggedIn: '未登录', statusError: '错误',
     tokenMgmt: '密钥管理',
@@ -631,10 +645,12 @@ const I = {
     changeToken: '更改密钥',
     tokenChanged: '密钥已更改，请使用新密钥重新登录。',
     tokenEmpty: '请输入密钥。',
-    testSuccess: '正常 — 已收到响应。',
+    testSuccess: '正常 — 请求成功。',
     testing: '测试中...',
+    startingLogin: '发起中...',
+    completingLogin: '完成中...',
     testCredBtn: '测试',
-    testCredTip: '使用此凭据发送测试消息。',
+    testCredTip: '发送真实请求验证此凭据是否可用。',
     reqSettings: '请求设置',
     reqSettingsDesc: '配置凭据轮询和错误重试行为。',
     rotationLabel: '凭据轮询',
@@ -655,10 +671,12 @@ const I = {
     proxyLabel: '代理',
     proxyHint: '留空则不使用代理',
     proxyPlaceholder: 'http://127.0.0.1:7890',
-    acpTitle: 'ACP 模式（实验性）',
-    acpLabel: '启用 ACP 模式',
-    acpHint: '保持 CLI 进程常驻，减少冷启动，支持会话',
-    acpIdleLabel: '空闲超时（秒）',
+    workerTitle: '工作进程设置',
+    maxWorkersLabel: '最大进程数',
+    maxWorkersHint: '0 = 不限制',
+    failoverWorkersLabel: '故障转移进程',
+    failoverWorkersHint: '预热的备用进程，故障转移时即时切换',
+    acpIdleLabel: '进程空闲超时（秒）',
     acpIdleHint: '0 = 不超时',
     acpSessions: 'ACP 会话',
     acpSessionsDesc: '管理活跃的 ACP 会话和工作进程。',
@@ -765,9 +783,11 @@ function applyLang() {
   $('proxy-input').placeholder = t('proxyPlaceholder');
   $('t-timeout-label').textContent = t('timeoutLabel');
   $('t-timeout-hint').textContent = t('timeoutHint');
-  $('t-acp-title').textContent = t('acpTitle');
-  $('t-acp-label').textContent = t('acpLabel');
-  $('t-acp-hint').textContent = t('acpHint');
+  $('t-worker-title').textContent = t('workerTitle');
+  $('t-max-workers-label').textContent = t('maxWorkersLabel');
+  $('t-max-workers-hint').textContent = t('maxWorkersHint');
+  $('t-failover-workers-label').textContent = t('failoverWorkersLabel');
+  $('t-failover-workers-hint').textContent = t('failoverWorkersHint');
   $('t-acp-idle-label').textContent = t('acpIdleLabel');
   $('t-acp-idle-hint').textContent = t('acpIdleHint');
   $('t-acp-sessions').textContent = t('acpSessions');
@@ -886,7 +906,6 @@ function renderStatus(health, models, creds) {
   const items = [
     { l: t('health'), v: health.ok ? t('ok') : t('error'), d: health.ok ? 'ok' : 'err' },
     { l: t('cli'), v: health.cliBuilt ? t('built') : t('notBuilt'), d: health.cliBuilt ? 'ok' : 'err' },
-    { l: t('context'), v: t('isolated'), d: 'ok' },
     { l: t('model'), v: models.currentModel?.label || t('unknown'), d: 'warn' },
     { l: t('credential'), v: creds.currentCredentialId ? t('active') : t('none'), d: creds.currentCredentialId ? 'ok' : 'warn' },
   ];
@@ -1067,6 +1086,10 @@ $('refresh-creds-btn').onclick = () => refreshHealth().catch(showErr);
 $('refresh-quotas-btn').onclick = () => refreshQuotas().catch(showErr);
 
 $('start-login-btn').onclick = async () => {
+  const btn = $('start-login-btn');
+  const origText = btn.textContent;
+  btn.disabled = true;
+  btn.innerHTML = '<span style="display:inline-block;width:12px;height:12px;border:2px solid rgba(255,255,255,.3);border-top-color:#fff;border-radius:50%;animation:spin .6s linear infinite;vertical-align:middle;margin-right:4px"></span>' + t('startingLogin');
   try {
     setNotice('');
     const p = await api('/v1/credentials/login',{
@@ -1081,7 +1104,10 @@ $('start-login-btn').onclick = async () => {
     $('login-output').style.display = 'block';
     $('login-output').textContent = JSON.stringify(p, null, 2);
     await refreshHealth();
-  } catch(e) { showErr(e); }
+  } catch(e) { showErr(e); } finally {
+    btn.disabled = false;
+    btn.textContent = origText;
+  }
 };
 
 $('open-auth-btn').onclick = () => {
@@ -1090,6 +1116,10 @@ $('open-auth-btn').onclick = () => {
 };
 
 $('complete-login-btn').onclick = async () => {
+  const btn = $('complete-login-btn');
+  const origText = btn.textContent;
+  btn.disabled = true;
+  btn.innerHTML = '<span style="display:inline-block;width:12px;height:12px;border:2px solid rgba(255,255,255,.3);border-top-color:#fff;border-radius:50%;animation:spin .6s linear infinite;vertical-align:middle;margin-right:4px"></span>' + t('completingLogin');
   try {
     setNotice('');
     if (!S.loginId) throw new Error(t('startFirst'));
@@ -1101,7 +1131,10 @@ $('complete-login-btn').onclick = async () => {
     $('login-output').style.display = 'block';
     $('login-output').textContent = JSON.stringify(p, null, 2);
     await refreshAll();
-  } catch(e) { showErr(e); }
+  } catch(e) { showErr(e); } finally {
+    btn.disabled = false;
+    btn.textContent = origText;
+  }
 };
 
 $('check-status-btn').onclick = async () => {
@@ -1172,24 +1205,34 @@ $('cred-list').onclick = e => {
 async function testCredential(credentialId) {
   const btn = document.querySelector('button[data-a="test"][data-id="'+credentialId+'"]');
   const resultEl = $('cred-test-'+credentialId);
-  if (btn) { btn.disabled = true; btn.textContent = t('testing'); }
+  if (btn) { btn.disabled = true; btn.innerHTML = '<span style="display:inline-block;width:12px;height:12px;border:2px solid rgba(255,255,255,.3);border-top-color:#fff;border-radius:50%;animation:spin .6s linear infinite;vertical-align:middle;margin-right:4px"></span>' + t('testing'); }
   if (resultEl) { resultEl.className = 'cred-test-result'; resultEl.textContent = ''; }
   try {
+    // Temporarily switch to this credential, send a minimal request, then restore
     const prevCred = S.lastCreds?.currentCredentialId;
-    await api('/v1/credentials/current',{method:'PUT',body:JSON.stringify({credentialId})});
+    if (prevCred !== credentialId) {
+      await api('/v1/credentials/current',{method:'PUT',body:JSON.stringify({credentialId})});
+    }
     const result = await api('/v1/openai/chat/completions',{
       method:'POST',
-      body:JSON.stringify({messages:[{role:'user',content:'Hello, reply with exactly: OK'}]}),
+      body:JSON.stringify({messages:[{role:'user',content:'Hi'}],max_tokens:1}),
     });
     if (prevCred && prevCred !== credentialId) {
-      await api('/v1/credentials/current',{method:'PUT',body:JSON.stringify({credentialId:prevCred})});
+      await api('/v1/credentials/current',{method:'PUT',body:JSON.stringify({credentialId:prevCred})}).catch(()=>{});
     }
     const text = result?.choices?.[0]?.message?.content || '';
     if (resultEl) {
       resultEl.className = 'cred-test-result test-ok';
-      resultEl.textContent = t('testSuccess') + ' — ' + text.slice(0,120);
+      resultEl.textContent = t('testSuccess') + (text ? ' — ' + text.slice(0,80) : '');
     }
   } catch(e) {
+    // Try to restore previous credential even on error
+    try {
+      const prevCred = S.lastCreds?.currentCredentialId;
+      if (prevCred && prevCred !== credentialId) {
+        await api('/v1/credentials/current',{method:'PUT',body:JSON.stringify({credentialId:prevCred})});
+      }
+    } catch(_) {}
     const msg = e instanceof Error ? e.message : String(e);
     if (resultEl) {
       resultEl.className = 'cred-test-result test-err';
@@ -1232,12 +1275,6 @@ $('save-open-api-btn').onclick = async () => {
 $('retry-toggle').onchange = () => {
   $('retry-count-row').style.display = $('retry-toggle').checked ? '' : 'none';
 };
-$('acp-toggle').onchange = () => {
-  $('acp-idle-row').style.display = $('acp-toggle').checked ? '' : 'none';
-  $('acp-sessions-card').style.display = $('acp-toggle').checked ? '' : 'none';
-  if ($('acp-toggle').checked) loadAcpStatus();
-};
-
 $('save-settings-btn').onclick = async () => {
   try {
     const timeoutSec = parseFloat($('timeout-input').value) || 0;
@@ -1252,7 +1289,8 @@ $('save-settings-btn').onclick = async () => {
         extensionsEnabled: $('extensions-toggle').checked,
         skillsEnabled: $('skills-toggle').checked,
         proxyUrl: $('proxy-input').value.trim(),
-        acpEnabled: $('acp-toggle').checked,
+        maxWorkers: parseInt($('max-workers-input').value, 10) || 0,
+        failoverWorkers: parseInt($('failover-workers-input').value, 10) || 0,
         acpIdleTimeoutMs: Math.floor((parseFloat($('acp-idle-input').value) || 300) * 1000),
       }),
     });
@@ -1265,6 +1303,7 @@ async function loadSettings() {
   try {
     const [p, oa] = await Promise.all([api('/v1/settings'), api('/v1/auth/open-api')]);
     const s = p.settings || {};
+    S.lastSettings = s;
     $('rotation-toggle').checked = !!s.rotationEnabled;
     $('retry-toggle').checked = !!s.retryEnabled;
     $('retry-count-select').value = String(s.retryCount || 3);
@@ -1273,9 +1312,8 @@ async function loadSettings() {
     $('extensions-toggle').checked = !!s.extensionsEnabled;
     $('skills-toggle').checked = !!s.skillsEnabled;
     $('proxy-input').value = s.proxyUrl || '';
-    $('acp-toggle').checked = !!s.acpEnabled;
-    $('acp-idle-row').style.display = s.acpEnabled ? '' : 'none';
-    $('acp-sessions-card').style.display = s.acpEnabled ? '' : 'none';
+    $('max-workers-input').value = String(s.maxWorkers || 0);
+    $('failover-workers-input').value = String(s.failoverWorkers || 0);
     const acpIdleSec = (s.acpIdleTimeoutMs || 300000) / 1000;
     $('acp-idle-input').value = String(acpIdleSec);
     const timeoutSec = (s.timeoutMs || 0) / 1000;
@@ -1283,7 +1321,7 @@ async function loadSettings() {
     const defSec = p.defaultTimeoutMs ? (p.defaultTimeoutMs / 1000) : 600;
     $('t-timeout-hint').textContent = t('timeoutHint') + ' (' + defSec + 's)';
     $('open-api-toggle').checked = !!oa.openApiEnabled;
-    if (s.acpEnabled) loadAcpStatus();
+    loadAcpStatus();
   } catch(e) {}
 }
 
@@ -1329,7 +1367,10 @@ function showErr(e) {
 /* ── Boot ── */
 async function boot() {
   applyLang();
-  try { await Promise.all([refreshAll(), loadSettings()]); } catch(e) { showErr(e); }
+  try {
+    await loadSettings();
+    await refreshAll();
+  } catch(e) { showErr(e); }
 }
 
 // Apply language on load (before auth)

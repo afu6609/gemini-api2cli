@@ -124,6 +124,11 @@ export async function loadConfig(
     trustedFolder: true,
     extensionLoader,
     checkpointing,
+    proxy:
+      process.env['HTTPS_PROXY'] ||
+      process.env['https_proxy'] ||
+      process.env['HTTP_PROXY'] ||
+      process.env['http_proxy'],
     interactive: !isHeadlessMode(),
     enableInteractiveShell: !isHeadlessMode(),
     ptyInfo: 'auto',

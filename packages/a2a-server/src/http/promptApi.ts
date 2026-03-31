@@ -237,8 +237,9 @@ type PromptApiSettings = {
   extensionsEnabled: boolean;
   skillsEnabled: boolean;
   proxyUrl: string;
-  acpEnabled: boolean;
   acpIdleTimeoutMs: number;
+  maxWorkers: number;
+  failoverWorkers: number;
 };
 
 type PromptApiState = {
@@ -246,9 +247,13 @@ type PromptApiState = {
   credentialStore: PromptCredentialStore;
   loginJobs: Map<string, PromptCredentialLoginJob>;
   settings: PromptApiSettings;
-  acpPool: AcpProcessPool | null;
+  acpPool: AcpProcessPool;
   rotationIndex: number;
+  /** credentialId → timestamp when it was last marked unhealthy */
+  credentialCooldowns: Map<string, number>;
 };
+
+const CREDENTIAL_COOLDOWN_MS = 60_000; // 1 minute cooldown after 429/auth failure
 type PromptCredentialLoginJob = {
   id: string;
   status: 'awaiting_callback' | 'succeeded' | 'failed';
@@ -439,7 +444,10 @@ type PromptInvocation = {
   didTimeout: () => boolean;
 };
 
-function createPromptApiState(credentialStoreRoot?: string): PromptApiState {
+function createPromptApiState(
+  credentialStoreRoot: string | undefined,
+  acpPool: AcpProcessPool,
+): PromptApiState {
   return {
     currentModel: DEFAULT_PROMPT_API_MODEL,
     credentialStore: new PromptCredentialStore(credentialStoreRoot),
@@ -453,11 +461,13 @@ function createPromptApiState(credentialStoreRoot?: string): PromptApiState {
       extensionsEnabled: false,
       skillsEnabled: false,
       proxyUrl: '',
-      acpEnabled: false,
       acpIdleTimeoutMs: 300000,
+      maxWorkers: 2,
+      failoverWorkers: 1,
     },
-    acpPool: null,
+    acpPool,
     rotationIndex: 0,
+    credentialCooldowns: new Map(),
   };
 }
 
@@ -690,7 +700,7 @@ async function getPromptApiCredentialQuotaPayload(
     const rawOauth = readFileSync(oauthPath, 'utf8');
     // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
     const credentials = JSON.parse(rawOauth) as Credentials;
-    const client = createPromptCredentialOAuthClient();
+    const client = createPromptCredentialOAuthClient(state.settings.proxyUrl);
     client.setCredentials(credentials);
 
     const userData = await setupUser(client);
@@ -939,10 +949,17 @@ async function startPromptInvocation(
   }
 }
 
-function createPromptCredentialOAuthClient(): OAuth2Client {
+function createPromptCredentialOAuthClient(proxyUrl?: string): OAuth2Client {
   return new OAuth2Client({
     clientId: OAUTH_CLIENT_ID,
     clientSecret: OAUTH_CLIENT_SECRET,
+    ...(proxyUrl
+      ? {
+          transporterOptions: {
+            proxy: proxyUrl,
+          },
+        }
+      : {}),
   });
 }
 
@@ -980,7 +997,7 @@ async function startPromptApiCredentialLogin(
     authUrl: '',
   };
 
-  const client = createPromptCredentialOAuthClient();
+  const client = createPromptCredentialOAuthClient(state.settings.proxyUrl);
   loginJob.authUrl = client.generateAuthUrl({
     redirect_uri: loginJob.redirectUri,
     access_type: 'offline',
@@ -1087,7 +1104,7 @@ async function completePromptApiCredentialLogin(
     );
   }
 
-  const client = createPromptCredentialOAuthClient();
+  const client = createPromptCredentialOAuthClient(state.settings.proxyUrl);
   let tokens: Credentials;
   try {
     const tokenResponse = await client.getToken({
@@ -1268,18 +1285,70 @@ async function runSingleJsonInvocation(
 
 /* ── ACP-mode request handler ── */
 
+async function getEffectiveCredentialIdAndHome(
+  deps: Required<PromptApiDependencies>,
+  state: PromptApiState,
+): Promise<{ credentialId: string; homeDir: string }> {
+  pruneCredentialCooldowns(state);
+
+  // Rotation mode: cycle through all credentials, skipping cooled-down ones
+  if (state.settings.rotationEnabled) {
+    const credentials = await state.credentialStore.listCredentials();
+    if (credentials.length > 0) {
+      // Try up to credentials.length times to find a healthy one
+      for (let i = 0; i < credentials.length; i++) {
+        const idx = state.rotationIndex % credentials.length;
+        state.rotationIndex = idx + 1;
+        const credential = credentials[idx];
+        if (state.credentialCooldowns.has(credential.id)) {
+          logger.info(
+            `[Prompt API] Rotation: skipping cooled-down credential "${credential.label}" (${credential.id})`,
+          );
+          continue;
+        }
+        logger.info(
+          `[Prompt API] Rotation: using credential "${credential.label}" (${credential.id})`,
+        );
+        const homeDir = state.credentialStore.getCredentialHomeDir(
+          credential.id,
+        );
+        return { credentialId: credential.id, homeDir };
+      }
+      // All credentials cooled down, use the next one anyway (best effort)
+      const idx = state.rotationIndex % credentials.length;
+      state.rotationIndex = idx + 1;
+      const credential = credentials[idx];
+      logger.warn(
+        `[Prompt API] All credentials cooled down, using "${credential.label}" anyway`,
+      );
+      const homeDir = state.credentialStore.getCredentialHomeDir(credential.id);
+      return { credentialId: credential.id, homeDir };
+    }
+  }
+
+  const currentCredentialId =
+    await state.credentialStore.getCurrentCredentialId();
+  if (!currentCredentialId) {
+    return { credentialId: 'default', homeDir: deps.sourceGeminiCliHome };
+  }
+
+  const credential =
+    await state.credentialStore.getCredential(currentCredentialId);
+  if (!credential) {
+    return { credentialId: 'default', homeDir: deps.sourceGeminiCliHome };
+  }
+
+  const homeDir =
+    state.credentialStore.getCredentialHomeDir(currentCredentialId);
+  return { credentialId: currentCredentialId, homeDir };
+}
+
 async function getAcpWorkerAndSession(
   deps: Required<PromptApiDependencies>,
   state: PromptApiState,
 ) {
-  if (!state.acpPool) {
-    throw new Error('ACP pool not initialized');
-  }
-
-  const credentialHomeDir = await getEffectiveSourceGeminiCliHome(deps, state);
-  const currentCredentialId =
-    await state.credentialStore.getCurrentCredentialId();
-  const credentialId = currentCredentialId ?? 'default';
+  const { credentialId, homeDir: credentialHomeDir } =
+    await getEffectiveCredentialIdAndHome(deps, state);
 
   const worker = await state.acpPool.getOrCreate(
     credentialId,
@@ -1290,16 +1359,95 @@ async function getAcpWorkerAndSession(
       extensionsEnabled: state.settings.extensionsEnabled,
       skillsEnabled: state.settings.skillsEnabled,
       proxyUrl: state.settings.proxyUrl,
+      maxWorkers: state.settings.maxWorkers,
+      failoverWorkers: state.settings.failoverWorkers,
     },
   );
 
-  // Reuse default session on the worker, create only on first call
-  const sessionId = await worker.getOrCreateDefaultSession();
-  return { worker, sessionId };
+  // Create a fresh session per request to avoid server-side context accumulation.
+  // SillyTavern and OpenAI-compatible clients send full history each request,
+  // so reusing a session would cause duplicate context and token waste.
+  const sessionId = await worker.createSession();
+  return { worker, sessionId, credentialId };
 }
 
-function promptToContentBlocks(prompt: string): ContentBlock[] {
-  return [{ type: 'text', text: prompt }];
+function promptToContentBlocks(
+  prompt: string,
+  systemPrompt?: string,
+): ContentBlock[] {
+  const blocks: ContentBlock[] = [];
+  if (systemPrompt) {
+    blocks.push({
+      type: 'text',
+      text: `[System Instruction]\n${systemPrompt}\n[End System Instruction]`,
+    });
+  }
+  blocks.push({ type: 'text', text: prompt });
+  return blocks;
+}
+
+function pruneCredentialCooldowns(state: PromptApiState): void {
+  const now = Date.now();
+  for (const [id, ts] of state.credentialCooldowns) {
+    if (now - ts > CREDENTIAL_COOLDOWN_MS) {
+      state.credentialCooldowns.delete(id);
+    }
+  }
+}
+
+/**
+ * Checks if an error is likely a credential/quota issue (429, auth error)
+ * that could be resolved by switching to a different credential.
+ */
+function isCredentialFailoverError(err: unknown): boolean {
+  const msg = extractErrorMessage(err).toLowerCase();
+  return (
+    msg.includes('429') ||
+    msg.includes('rate limit') ||
+    msg.includes('quota') ||
+    msg.includes('resource exhausted') ||
+    msg.includes('unauthorized') ||
+    msg.includes('authentication') ||
+    msg.includes('permission denied') ||
+    msg.includes('forbidden')
+  );
+}
+
+/**
+ * Try to get a worker+session from a different credential than the ones already tried.
+ */
+async function getAcpWorkerAndSessionExcluding(
+  deps: Required<PromptApiDependencies>,
+  state: PromptApiState,
+  excludeCredentialIds: Set<string>,
+): Promise<{
+  worker: Awaited<ReturnType<typeof getAcpWorkerAndSession>>['worker'];
+  sessionId: string;
+  credentialId: string;
+} | null> {
+  pruneCredentialCooldowns(state);
+  const credentials = await state.credentialStore.listCredentials();
+  for (const cred of credentials) {
+    if (excludeCredentialIds.has(cred.id)) continue;
+    if (state.credentialCooldowns.has(cred.id)) continue;
+    const homeDir = state.credentialStore.getCredentialHomeDir(cred.id);
+    try {
+      const worker = await state.acpPool.getOrCreate(cred.id, homeDir, {
+        idleTimeoutMs: state.settings.acpIdleTimeoutMs,
+        mcpEnabled: state.settings.mcpEnabled,
+        extensionsEnabled: state.settings.extensionsEnabled,
+        skillsEnabled: state.settings.skillsEnabled,
+        proxyUrl: state.settings.proxyUrl,
+        maxWorkers: state.settings.maxWorkers,
+        failoverWorkers: state.settings.failoverWorkers,
+      });
+      const sessionId = await worker.createSession();
+      return { worker, sessionId, credentialId: cred.id };
+    } catch {
+      continue;
+    }
+  }
+  return null;
 }
 
 function extractErrorMessage(err: unknown): string {
@@ -1328,45 +1476,116 @@ async function handleAcpJsonRequest(
   const requestId = `req-${randomUUID()}`;
   const parsed = adapter.parseRequest(req.body);
   const model = normalizeRequestedModel(parsed.model, state);
-  const contentBlocks = promptToContentBlocks(parsed.prompt);
+  const contentBlocks = promptToContentBlocks(
+    parsed.prompt,
+    parsed.systemPrompt,
+  );
 
-  let worker: Awaited<ReturnType<typeof getAcpWorkerAndSession>>['worker'];
-  let sessionId: string;
-  try {
-    ({ worker, sessionId } = await getAcpWorkerAndSession(deps, state));
-  } catch (err) {
-    const msg = extractErrorMessage(err);
-    logger.error(`[ACP] Failed to get worker/session: ${msg}`);
-    return res
-      .status(500)
-      .json(adapter.buildJsonError(msg, 500, model, requestId));
-  }
+  const maxAttempts = state.settings.retryEnabled
+    ? Math.max(1, state.settings.retryCount + 1)
+    : 1;
+  const triedCredentials = new Set<string>();
+  let lastError = '';
 
-  let assistantText = '';
-  try {
-    await worker.prompt(
-      sessionId,
-      contentBlocks,
-      (update: SessionNotification) => {
-        if (
-          update.update.sessionUpdate === 'agent_message_chunk' &&
-          update.update.content.type === 'text'
-        ) {
-          assistantText += update.update.content.text;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    let worker: Awaited<ReturnType<typeof getAcpWorkerAndSession>>['worker'];
+    let sessionId: string;
+
+    try {
+      if (attempt === 0) {
+        const result = await getAcpWorkerAndSession(deps, state);
+        worker = result.worker;
+        sessionId = result.sessionId;
+        triedCredentials.add(result.credentialId);
+      } else {
+        // Failover: try a different credential
+        const alt = await getAcpWorkerAndSessionExcluding(
+          deps,
+          state,
+          triedCredentials,
+        );
+        if (!alt) {
+          logger.warn(
+            `[ACP] No more credentials available for failover (attempt ${attempt + 1})`,
+          );
+          break;
         }
-      },
-    );
+        worker = alt.worker;
+        sessionId = alt.sessionId;
+        triedCredentials.add(alt.credentialId);
+        logger.info(
+          `[ACP] Failover attempt ${attempt + 1}: switching to credential ${alt.credentialId}`,
+        );
+      }
+    } catch (err) {
+      lastError = extractErrorMessage(err);
+      logger.error(`[ACP] Failed to get worker/session: ${lastError}`);
+      continue;
+    }
 
-    return res
-      .status(200)
-      .json(adapter.buildJsonResponse(assistantText, model, requestId));
-  } catch (err) {
-    const msg = extractErrorMessage(err);
-    logger.error(`[ACP] Prompt error: ${msg}`);
-    return res
-      .status(500)
-      .json(adapter.buildJsonError(msg, 500, model, requestId));
+    if (parsed.model) {
+      try {
+        await worker.setSessionModel(sessionId, model);
+      } catch (err) {
+        logger.warn(
+          `[ACP] Failed to set model to ${model}: ${extractErrorMessage(err)}`,
+        );
+      }
+    }
+
+    try {
+      let assistantText = '';
+      await worker.prompt(
+        sessionId,
+        contentBlocks,
+        (update: SessionNotification) => {
+          if (
+            update.update.sessionUpdate === 'agent_message_chunk' &&
+            update.update.content.type === 'text'
+          ) {
+            assistantText += update.update.content.text;
+          }
+        },
+      );
+
+      return res
+        .status(200)
+        .json(adapter.buildJsonResponse(assistantText, model, requestId));
+    } catch (err) {
+      lastError = extractErrorMessage(err);
+      logger.error(
+        `[ACP] Prompt error (attempt ${attempt + 1}/${maxAttempts}): ${lastError}`,
+      );
+
+      // Mark credential as unhealthy and failover on credential/quota errors
+      if (isCredentialFailoverError(err)) {
+        state.credentialCooldowns.set(worker.credentialId, Date.now());
+        logger.info(
+          `[ACP] Credential ${worker.credentialId} cooled down for ${CREDENTIAL_COOLDOWN_MS / 1000}s`,
+        );
+      }
+      if (!isCredentialFailoverError(err) || attempt + 1 >= maxAttempts) {
+        return res
+          .status(500)
+          .json(adapter.buildJsonError(lastError, 500, model, requestId));
+      }
+    } finally {
+      if (worker && sessionId) {
+        worker.destroySession(sessionId);
+      }
+    }
   }
+
+  return res
+    .status(500)
+    .json(
+      adapter.buildJsonError(
+        lastError || 'All credentials exhausted.',
+        500,
+        model,
+        requestId,
+      ),
+    );
 }
 
 async function handleAcpStreamingRequest(
@@ -1379,76 +1598,157 @@ async function handleAcpStreamingRequest(
   const requestId = `req-${randomUUID()}`;
   const parsed = adapter.parseRequest(req.body);
   const model = normalizeRequestedModel(parsed.model, state);
-  const contentBlocks = promptToContentBlocks(parsed.prompt);
+  const contentBlocks = promptToContentBlocks(
+    parsed.prompt,
+    parsed.systemPrompt,
+  );
 
-  let worker: Awaited<ReturnType<typeof getAcpWorkerAndSession>>['worker'];
-  let sessionId: string;
-  try {
-    ({ worker, sessionId } = await getAcpWorkerAndSession(deps, state));
-  } catch (err) {
-    const msg = extractErrorMessage(err);
-    logger.error(`[ACP] Failed to get worker/session (stream): ${msg}`);
+  const maxAttempts = state.settings.retryEnabled
+    ? Math.max(1, state.settings.retryCount + 1)
+    : 1;
+  const triedCredentials = new Set<string>();
+  let lastError = '';
+  let headersSent = false;
+
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    let worker: Awaited<ReturnType<typeof getAcpWorkerAndSession>>['worker'];
+    let sessionId: string;
+
+    try {
+      if (attempt === 0) {
+        const result = await getAcpWorkerAndSession(deps, state);
+        worker = result.worker;
+        sessionId = result.sessionId;
+        triedCredentials.add(result.credentialId);
+      } else {
+        const alt = await getAcpWorkerAndSessionExcluding(
+          deps,
+          state,
+          triedCredentials,
+        );
+        if (!alt) {
+          logger.warn(
+            `[ACP] No more credentials available for failover (stream, attempt ${attempt + 1})`,
+          );
+          break;
+        }
+        worker = alt.worker;
+        sessionId = alt.sessionId;
+        triedCredentials.add(alt.credentialId);
+        logger.info(
+          `[ACP] Stream failover attempt ${attempt + 1}: switching to credential ${alt.credentialId}`,
+        );
+      }
+    } catch (err) {
+      lastError = extractErrorMessage(err);
+      logger.error(`[ACP] Failed to get worker/session (stream): ${lastError}`);
+      continue;
+    }
+
+    if (parsed.model) {
+      try {
+        await worker.setSessionModel(sessionId, model);
+      } catch (err) {
+        logger.warn(
+          `[ACP] Failed to set model to ${model}: ${extractErrorMessage(err)}`,
+        );
+      }
+    }
+
+    // Start streaming headers (only on first successful attempt)
+    if (!headersSent) {
+      res.setHeader('Content-Type', adapter.streamContentType);
+      res.setHeader('Cache-Control', 'no-cache, no-transform');
+      res.setHeader('X-Accel-Buffering', 'no');
+      res.flushHeaders();
+      headersSent = true;
+    }
+
+    let isFirst = true;
+    let cancelled = false;
+
+    const abortHandler = () => {
+      cancelled = true;
+      worker.cancelPrompt(sessionId).catch(() => {});
+    };
+    req.on('aborted', abortHandler);
+    res.on('close', abortHandler);
+
+    try {
+      await worker.prompt(
+        sessionId,
+        contentBlocks,
+        (update: SessionNotification) => {
+          if (cancelled) return;
+          if (
+            update.update.sessionUpdate === 'agent_message_chunk' &&
+            update.update.content.type === 'text'
+          ) {
+            res.write(
+              adapter.formatStreamChunk(
+                update.update.content.text,
+                model,
+                requestId,
+                isFirst,
+              ),
+            );
+            isFirst = false;
+          }
+        },
+      );
+
+      if (!cancelled) {
+        res.write(adapter.formatStreamEnd(model, requestId));
+      }
+      // Success — clean up and return
+      req.off('aborted', abortHandler);
+      res.off('close', abortHandler);
+      worker.destroySession(sessionId);
+      res.end();
+      return;
+    } catch (err) {
+      req.off('aborted', abortHandler);
+      res.off('close', abortHandler);
+      worker.destroySession(sessionId);
+
+      lastError = extractErrorMessage(err);
+      logger.error(
+        `[ACP] Prompt error (stream, attempt ${attempt + 1}/${maxAttempts}): ${lastError}`,
+      );
+
+      // Mark credential as unhealthy on failover-eligible errors
+      if (isCredentialFailoverError(err)) {
+        state.credentialCooldowns.set(worker.credentialId, Date.now());
+        logger.info(
+          `[ACP] Credential ${worker.credentialId} cooled down for ${CREDENTIAL_COOLDOWN_MS / 1000}s`,
+        );
+      }
+
+      // Can only failover if no chunks were sent yet
+      if (!isFirst || cancelled || !isCredentialFailoverError(err)) {
+        if (!cancelled) {
+          res.write(adapter.formatStreamError(lastError, model, requestId));
+        }
+        res.end();
+        return;
+      }
+      // isFirst=true means no chunks sent, safe to retry with next credential
+    }
+  }
+
+  // All attempts exhausted
+  if (!headersSent) {
     res.setHeader('Content-Type', adapter.streamContentType);
     res.flushHeaders();
-    res.write(adapter.formatStreamError(msg, model, requestId));
-    res.end();
-    return;
   }
-
-  res.setHeader('Content-Type', adapter.streamContentType);
-  res.setHeader('Cache-Control', 'no-cache, no-transform');
-  res.setHeader('X-Accel-Buffering', 'no');
-  res.flushHeaders();
-
-  let isFirst = true;
-  let cancelled = false;
-
-  const abortHandler = () => {
-    cancelled = true;
-    worker.cancelPrompt(sessionId).catch(() => {});
-  };
-
-  req.on('aborted', abortHandler);
-  res.on('close', abortHandler);
-
-  try {
-    await worker.prompt(
-      sessionId,
-      contentBlocks,
-      (update: SessionNotification) => {
-        if (cancelled) return;
-        if (
-          update.update.sessionUpdate === 'agent_message_chunk' &&
-          update.update.content.type === 'text'
-        ) {
-          res.write(
-            adapter.formatStreamChunk(
-              update.update.content.text,
-              model,
-              requestId,
-              isFirst,
-            ),
-          );
-          isFirst = false;
-        }
-      },
-    );
-
-    if (!cancelled) {
-      res.write(adapter.formatStreamEnd(model, requestId));
-    }
-  } catch (err) {
-    if (!cancelled) {
-      const msg = extractErrorMessage(err);
-      logger.error(`[ACP] Prompt error (stream): ${msg}`);
-      res.write(adapter.formatStreamError(msg, model, requestId));
-    }
-  } finally {
-    req.off('aborted', abortHandler);
-    res.off('close', abortHandler);
-    // Session is reused, not destroyed
-    res.end();
-  }
+  res.write(
+    adapter.formatStreamError(
+      lastError || 'All credentials exhausted.',
+      model,
+      requestId,
+    ),
+  );
+  res.end();
 }
 
 async function handleAdaptedJsonRequest(
@@ -1458,9 +1758,8 @@ async function handleAdaptedJsonRequest(
   deps: Required<PromptApiDependencies>,
   state: PromptApiState,
 ) {
-  if (state.settings.acpEnabled && state.acpPool) {
-    return handleAcpJsonRequest(req, res, adapter, deps, state);
-  }
+  return handleAcpJsonRequest(req, res, adapter, deps, state);
+  // Legacy spawn fallback kept below for reference but no longer reachable
   const requestId = `req-${randomUUID()}`;
   const parsed = adapter.parseRequest(req.body);
   const model = normalizeRequestedModel(parsed.model, state);
@@ -1512,9 +1811,8 @@ async function handleAdaptedStreamingRequest(
   deps: Required<PromptApiDependencies>,
   state: PromptApiState,
 ) {
-  if (state.settings.acpEnabled && state.acpPool) {
-    return handleAcpStreamingRequest(req, res, adapter, deps, state);
-  }
+  return handleAcpStreamingRequest(req, res, adapter, deps, state);
+  // Legacy spawn fallback kept below for reference but no longer reachable
   const requestId = `req-${randomUUID()}`;
   const parsed = adapter.parseRequest(req.body);
   const model = normalizeRequestedModel(parsed.model, state);
@@ -1604,7 +1902,67 @@ export function createPromptApiRouter(
       dependencies.credentialStoreRoot ??
       path.join(getSourceGeminiCliHome(), GEMINI_DIR_NAME, 'prompt-api'),
   };
-  const state = createPromptApiState(deps.credentialStoreRoot);
+  const acpPool = new AcpProcessPool({
+    cliEntryPath: deps.cliEntryPath,
+    spawnProcess: deps.spawnProcess,
+  });
+  const state = createPromptApiState(deps.credentialStoreRoot, acpPool);
+
+  // Pre-warm primary + failover workers in the background
+  void (async () => {
+    try {
+      const credentials = await state.credentialStore.listCredentials();
+      if (credentials.length === 0) {
+        logger.info('[ACP] No credentials found, skipping startup warm-up');
+        return;
+      }
+
+      const poolSettings = {
+        idleTimeoutMs: state.settings.acpIdleTimeoutMs,
+        mcpEnabled: state.settings.mcpEnabled,
+        extensionsEnabled: state.settings.extensionsEnabled,
+        skillsEnabled: state.settings.skillsEnabled,
+        proxyUrl: state.settings.proxyUrl,
+        maxWorkers: state.settings.maxWorkers,
+        failoverWorkers: state.settings.failoverWorkers,
+      };
+
+      // Warm up primary worker
+      const { credentialId, homeDir } = await getEffectiveCredentialIdAndHome(
+        deps,
+        state,
+      );
+      await state.acpPool.warmUp(credentialId, homeDir, poolSettings);
+
+      // Warm up failover workers with other credentials
+      const failoverCount = state.settings.failoverWorkers;
+      if (failoverCount > 0) {
+        let warmed = 0;
+        for (const cred of credentials) {
+          if (warmed >= failoverCount) break;
+          if (cred.id === credentialId) continue;
+          const credHomeDir = state.credentialStore.getCredentialHomeDir(
+            cred.id,
+          );
+          try {
+            await state.acpPool.warmUp(cred.id, credHomeDir, poolSettings);
+            warmed++;
+            logger.info(
+              `[ACP] Failover worker ${warmed}/${failoverCount} warmed: "${cred.label}"`,
+            );
+          } catch (err) {
+            logger.warn(
+              `[ACP] Failover warm-up failed for ${cred.id}: ${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
+        }
+      }
+    } catch (err) {
+      logger.warn(
+        `[ACP] Startup warm-up failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  })();
 
   // Eagerly resolve the token so it prints at startup, not on first request.
   getPromptApiToken();
@@ -1689,14 +2047,26 @@ export function createPromptApiRouter(
         }
         state.settings.timeoutMs = Math.floor(n);
       }
+      // Track whether ACP-affecting settings changed
+      let acpWorkerSettingsChanged = false;
+
       if (b['mcpEnabled'] !== undefined) {
-        state.settings.mcpEnabled = Boolean(b['mcpEnabled']);
+        const newVal = Boolean(b['mcpEnabled']);
+        if (state.settings.mcpEnabled !== newVal)
+          acpWorkerSettingsChanged = true;
+        state.settings.mcpEnabled = newVal;
       }
       if (b['extensionsEnabled'] !== undefined) {
-        state.settings.extensionsEnabled = Boolean(b['extensionsEnabled']);
+        const newVal = Boolean(b['extensionsEnabled']);
+        if (state.settings.extensionsEnabled !== newVal)
+          acpWorkerSettingsChanged = true;
+        state.settings.extensionsEnabled = newVal;
       }
       if (b['skillsEnabled'] !== undefined) {
-        state.settings.skillsEnabled = Boolean(b['skillsEnabled']);
+        const newVal = Boolean(b['skillsEnabled']);
+        if (state.settings.skillsEnabled !== newVal)
+          acpWorkerSettingsChanged = true;
+        state.settings.skillsEnabled = newVal;
       }
       if (b['proxyUrl'] !== undefined) {
         const url = String(b['proxyUrl']).trim();
@@ -1705,22 +2075,16 @@ export function createPromptApiRouter(
             '"proxyUrl" must be a valid HTTP/SOCKS proxy URL (e.g. http://127.0.0.1:7890).',
           );
         }
+        if (state.settings.proxyUrl !== url) acpWorkerSettingsChanged = true;
         state.settings.proxyUrl = url;
       }
-      if (b['acpEnabled'] !== undefined) {
-        const wasEnabled = state.settings.acpEnabled;
-        state.settings.acpEnabled = Boolean(b['acpEnabled']);
-        // Destroy all ACP workers when switching off
-        if (wasEnabled && !state.settings.acpEnabled && state.acpPool) {
-          void state.acpPool.destroyAll();
-        }
-        // Lazy-create pool when switching on
-        if (state.settings.acpEnabled && !state.acpPool) {
-          state.acpPool = new AcpProcessPool({
-            cliEntryPath: deps.cliEntryPath,
-            spawnProcess: deps.spawnProcess,
-          });
-        }
+
+      // Restart ACP workers if relevant settings changed
+      if (acpWorkerSettingsChanged && state.acpPool.size > 0) {
+        logger.info(
+          '[Prompt API] ACP-affecting settings changed, restarting workers',
+        );
+        void state.acpPool.destroyAll();
       }
       if (b['acpIdleTimeoutMs'] !== undefined) {
         const n = Number(b['acpIdleTimeoutMs']);
@@ -1730,6 +2094,24 @@ export function createPromptApiRouter(
           );
         }
         state.settings.acpIdleTimeoutMs = Math.floor(n);
+      }
+      if (b['maxWorkers'] !== undefined) {
+        const n = Number(b['maxWorkers']);
+        if (!Number.isFinite(n) || n < 0) {
+          throw new BadRequestError(
+            '"maxWorkers" must be a non-negative number (0 = unlimited).',
+          );
+        }
+        state.settings.maxWorkers = Math.floor(n);
+      }
+      if (b['failoverWorkers'] !== undefined) {
+        const n = Number(b['failoverWorkers']);
+        if (!Number.isFinite(n) || n < 0) {
+          throw new BadRequestError(
+            '"failoverWorkers" must be a non-negative number.',
+          );
+        }
+        state.settings.failoverWorkers = Math.floor(n);
       }
       return res
         .status(200)
@@ -1745,30 +2127,17 @@ export function createPromptApiRouter(
   });
 
   // ── ACP Management ──
-  router.get('/v1/acp/status', (_req, res) => {
-    if (!state.acpPool) {
-      return res.status(200).json({ enabled: false, workers: [] });
-    }
-    return res.status(200).json({
-      enabled: state.settings.acpEnabled,
+  router.get('/v1/acp/status', (_req, res) => res.status(200).json({
+      enabled: true,
       ...state.acpPool.getStatus(),
-    });
-  });
+    }));
 
-  router.get('/v1/acp/sessions', (_req, res) => {
-    if (!state.acpPool) {
-      return res.status(200).json({ sessions: [] });
-    }
-    return res.status(200).json({
+  router.get('/v1/acp/sessions', (_req, res) => res.status(200).json({
       sessions: state.acpPool.getAllSessions(),
-    });
-  });
+    }));
 
   router.post('/v1/acp/sessions', async (req, res) => {
     try {
-      if (!state.settings.acpEnabled || !state.acpPool) {
-        return res.status(400).json({ error: 'ACP mode is not enabled.' });
-      }
       const credentialHomeDir = await getEffectiveSourceGeminiCliHome(
         deps,
         state,
@@ -1786,6 +2155,8 @@ export function createPromptApiRouter(
           extensionsEnabled: state.settings.extensionsEnabled,
           skillsEnabled: state.settings.skillsEnabled,
           proxyUrl: state.settings.proxyUrl,
+          maxWorkers: state.settings.maxWorkers,
+          failoverWorkers: state.settings.failoverWorkers,
         },
       );
       const sessionId = await worker.createSession();
@@ -1798,9 +2169,6 @@ export function createPromptApiRouter(
   });
 
   router.delete('/v1/acp/sessions/:sessionId', (req, res) => {
-    if (!state.acpPool) {
-      return res.status(400).json({ error: 'ACP mode is not enabled.' });
-    }
     const { sessionId } = req.params as Record<string, string>;
     const worker = state.acpPool.findWorkerBySession(sessionId);
     if (!worker) {
@@ -1811,9 +2179,7 @@ export function createPromptApiRouter(
   });
 
   router.delete('/v1/acp/workers', async (_req, res) => {
-    if (state.acpPool) {
-      await state.acpPool.destroyAll();
-    }
+    await state.acpPool.destroyAll();
     return res.status(200).json({ ok: true });
   });
 

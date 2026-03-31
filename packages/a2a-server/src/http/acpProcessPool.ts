@@ -6,7 +6,7 @@
 
 import type { ChildProcessWithoutNullStreams, spawn } from 'node:child_process';
 import { Readable, Writable } from 'node:stream';
-import { mkdtemp, rm, mkdir, copyFile } from 'node:fs/promises';
+import { mkdtemp, rm, mkdir, copyFile, unlink } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { tmpdir } from '@google/gemini-cli-core';
 import * as path from 'node:path';
@@ -53,6 +53,8 @@ export interface AcpPoolSettings {
   extensionsEnabled: boolean;
   skillsEnabled: boolean;
   proxyUrl: string;
+  maxWorkers: number;
+  failoverWorkers: number;
 }
 
 const GEMINI_DIR_NAME = '.gemini';
@@ -89,10 +91,11 @@ function buildAcpChildEnv(
 }
 
 /**
- * A single long-lived CLI process running in ACP mode, bound to one credential.
+ * A single long-lived CLI process running in ACP mode.
+ * Can switch credentials at runtime via re-authentication.
  */
 export class AcpWorker {
-  readonly credentialId: string;
+  credentialId: string;
   private child: ChildProcessWithoutNullStreams | undefined;
   private connection: acp.ClientSideConnection | undefined;
   private _state: AcpWorkerState = 'starting';
@@ -371,6 +374,56 @@ export class AcpWorker {
   }
 
   /**
+   * Set the model for a session.
+   */
+  async setSessionModel(sessionId: string, modelId: string): Promise<void> {
+    if (this._state !== 'ready' || !this.connection) {
+      throw new Error('ACP worker not ready');
+    }
+    await this.connection.unstable_setSessionModel({ sessionId, modelId });
+    this.touchActivity();
+  }
+
+  /**
+   * Switch this worker to a different credential by copying new credential
+   * files into the isolated home and re-authenticating.
+   */
+  async switchCredential(
+    newCredentialId: string,
+    newCredentialHomeDir: string,
+  ): Promise<void> {
+    if (this._state !== 'ready' || !this.connection || !this.tempDir) {
+      throw new Error('ACP worker not ready for credential switch');
+    }
+
+    // Clear old credential files, then copy new ones
+    const geminiDir = path.join(this.tempDir, 'home', GEMINI_DIR_NAME);
+    const sourceGeminiDir = path.join(newCredentialHomeDir, GEMINI_DIR_NAME);
+    const credFiles = ['oauth_creds.json', 'gemini-credentials.json'];
+    for (const file of credFiles) {
+      const target = path.join(geminiDir, file);
+      try {
+        await unlink(target);
+      } catch {
+        /* file may not exist */
+      }
+      const src = path.join(sourceGeminiDir, file);
+      if (existsSync(src)) {
+        await copyFile(src, target);
+      }
+    }
+
+    // Re-authenticate with the new credentials
+    await this.connection.authenticate({
+      methodId: 'oauth-personal',
+    });
+
+    this.credentialId = newCredentialId;
+    this.touchActivity();
+    logger.info(`[ACP] Worker switched credential to ${newCredentialId}`);
+  }
+
+  /**
    * Cancel an ongoing prompt.
    */
   async cancelPrompt(sessionId: string): Promise<void> {
@@ -460,6 +513,7 @@ export class AcpProcessPool {
 
   /**
    * Get or create a worker for the given credential.
+   * When maxWorkers > 0 and the pool is full, evicts the least recently active worker.
    */
   async getOrCreate(
     credentialId: string,
@@ -476,8 +530,71 @@ export class AcpProcessPool {
       this.workers.delete(credentialId);
     }
 
+    // At capacity: try to switch an existing idle worker's credential instead of cold-starting
+    const max =
+      settings.maxWorkers > 0
+        ? settings.maxWorkers + (settings.failoverWorkers || 0)
+        : 0;
+    if (max > 0 && this.workers.size >= max) {
+      // Find the least recently active idle worker to reuse
+      let reuseKey: string | undefined;
+      let reuseTime = Infinity;
+      for (const [key, w] of this.workers) {
+        if (
+          w.state === 'ready' &&
+          w.sessionCount === 0 &&
+          w.lastActivity < reuseTime
+        ) {
+          reuseTime = w.lastActivity;
+          reuseKey = key;
+        }
+      }
+      // Only switch workers with no active sessions to avoid breaking in-flight requests
+
+      if (reuseKey) {
+        const reuseWorker = this.workers.get(reuseKey)!;
+        try {
+          logger.info(
+            `[ACP] Pool at capacity (${max}), switching worker ${reuseKey} → ${credentialId}`,
+          );
+          await reuseWorker.switchCredential(credentialId, credentialHomeDir);
+          // Re-key in the map
+          this.workers.delete(reuseKey);
+          this.workers.set(credentialId, reuseWorker);
+          return reuseWorker;
+        } catch (err) {
+          logger.warn(
+            `[ACP] Credential switch failed, falling back to evict+rebuild: ${err instanceof Error ? err.message : String(err)}`,
+          );
+          // Switch failed, evict and rebuild below
+          this.workers.delete(reuseKey);
+          void reuseWorker.shutdown();
+        }
+      } else {
+        // No idle worker to switch — evict the least recently active one as last resort
+        let oldestKey: string | undefined;
+        let oldestTime = Infinity;
+        for (const [key, w] of this.workers) {
+          if (w.lastActivity < oldestTime) {
+            oldestTime = w.lastActivity;
+            oldestKey = key;
+          }
+        }
+        if (oldestKey) {
+          logger.info(
+            `[ACP] Pool at capacity (${max}), evicting worker ${oldestKey}`,
+          );
+          const evicted = this.workers.get(oldestKey);
+          this.workers.delete(oldestKey);
+          if (evicted) void evicted.shutdown();
+        }
+      }
+    }
+
     worker = new AcpWorker(credentialId, settings.idleTimeoutMs, () => {
-      this.workers.delete(credentialId);
+      // Use worker.credentialId (not the captured closure value)
+      // because switchCredential may have changed it
+      this.workers.delete(worker!.credentialId);
     });
 
     this.workers.set(credentialId, worker);
@@ -545,6 +662,24 @@ export class AcpProcessPool {
       }
     }
     return undefined;
+  }
+
+  /**
+   * Pre-warm a worker for the given credential so the first request avoids cold start.
+   */
+  async warmUp(
+    credentialId: string,
+    credentialHomeDir: string,
+    settings: AcpPoolSettings,
+  ): Promise<void> {
+    try {
+      await this.getOrCreate(credentialId, credentialHomeDir, settings);
+      logger.info(`[ACP] Worker pre-warmed for credential ${credentialId}`);
+    } catch (err) {
+      logger.warn(
+        `[ACP] Worker warm-up failed for credential ${credentialId}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
   }
 
   get size(): number {

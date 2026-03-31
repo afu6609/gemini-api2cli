@@ -38,6 +38,8 @@ import { Task } from './task.js';
 import { requestStorage } from '../http/requestStorage.js';
 import { pushTaskStateFailed } from '../utils/executor_utils.js';
 
+const SOCKET_END_ABORT_GRACE_PERIOD_MS = 30_000;
+
 /**
  * Provides a wrapper for Task. Passes data from Task to SDKTask.
  * The idea is to use this class inside CoderAgentExecutor to replace Task.
@@ -85,18 +87,46 @@ export class CoderAgentExecutor implements AgentExecutor {
   private tasks: Map<string, TaskWrapper> = new Map();
   // Track tasks with an active execution loop.
   private executingTasks = new Set<string>();
+  private cachedConfig: Config | undefined;
+  private cachedConfigWorkspace: string | undefined;
 
-  constructor(private taskStore?: TaskStore) {}
+  constructor(
+    private taskStore?: TaskStore,
+    sharedConfig?: Config,
+  ) {
+    if (sharedConfig) {
+      this.cachedConfig = sharedConfig;
+      this.cachedConfigWorkspace = process.cwd();
+    }
+  }
 
   private async getConfig(
     agentSettings: AgentSettings,
     taskId: string,
   ): Promise<Config> {
     const workspaceRoot = setTargetDir(agentSettings);
+
+    // Reuse cached config if workspace hasn't changed
+    if (this.cachedConfig && this.cachedConfigWorkspace === workspaceRoot) {
+      logger.info(
+        `[CoderAgentExecutor] Reusing cached config for task ${taskId}`,
+      );
+      return this.cachedConfig;
+    }
+
     loadEnvironment(); // Will override any global env with workspace envs
     const settings = loadSettings(workspaceRoot);
     const extensions = loadExtensions(workspaceRoot);
-    return loadConfig(settings, new SimpleExtensionLoader(extensions), taskId);
+    const config = await loadConfig(
+      settings,
+      new SimpleExtensionLoader(extensions),
+      taskId,
+    );
+
+    // Cache for subsequent tasks in the same workspace
+    this.cachedConfig = config;
+    this.cachedConfigWorkspace = workspaceRoot;
+    return config;
   }
 
   /**
@@ -320,30 +350,57 @@ export class CoderAgentExecutor implements AgentExecutor {
 
     const abortController = new AbortController();
     const abortSignal = abortController.signal;
+    let cleanupSocketHandlers: (() => void) | undefined;
 
     if (store) {
       // Grab the raw socket from the request object
       const socket = store.req.socket;
-      const onSocketEnd = () => {
-        logger.info(
-          `[CoderAgentExecutor] Socket ended for message ${userMessage.messageId} (task ${taskId}). Aborting execution loop.`,
-        );
-        if (!abortController.signal.aborted) {
-          abortController.abort();
+      let socketEndAbortTimer: ReturnType<typeof setTimeout> | undefined;
+
+      const clearPendingSocketEndAbort = () => {
+        if (socketEndAbortTimer) {
+          clearTimeout(socketEndAbortTimer);
+          socketEndAbortTimer = undefined;
         }
-        // Clean up the listener to prevent memory leaks
+      };
+
+      const onSocketEnd = () => {
+        if (abortController.signal.aborted || socketEndAbortTimer) {
+          return;
+        }
+
+        logger.info(
+          `[CoderAgentExecutor] Socket ended for message ${userMessage.messageId} (task ${taskId}). Waiting ${SOCKET_END_ABORT_GRACE_PERIOD_MS}ms before aborting execution loop.`,
+        );
+
+        socketEndAbortTimer = setTimeout(() => {
+          socketEndAbortTimer = undefined;
+          if (!abortController.signal.aborted) {
+            logger.info(
+              `[CoderAgentExecutor] Socket remained inactive for ${SOCKET_END_ABORT_GRACE_PERIOD_MS}ms after end for message ${userMessage.messageId} (task ${taskId}). Aborting execution loop.`,
+            );
+            abortController.abort();
+          }
+        }, SOCKET_END_ABORT_GRACE_PERIOD_MS);
+      };
+
+      const onSocketClose = () => {
         socket.removeListener('end', onSocketEnd);
+      };
+
+      cleanupSocketHandlers = () => {
+        clearPendingSocketEndAbort();
+        socket.removeListener('end', onSocketEnd);
+        socket.removeListener('close', onSocketClose);
       };
 
       // Listen on the socket's 'end' event (remote closed the connection)
       socket.on('end', onSocketEnd);
-      socket.once('close', () => {
-        socket.removeListener('end', onSocketEnd);
-      });
+      socket.once('close', onSocketClose);
 
       // It's also good practice to remove the listener if the task completes successfully
       abortSignal.addEventListener('abort', () => {
-        socket.removeListener('end', onSocketEnd);
+        cleanupSocketHandlers?.();
       });
       logger.info(
         `[CoderAgentExecutor] Socket close handler set up for task ${taskId}.`,
@@ -625,6 +682,8 @@ export class CoderAgentExecutor implements AgentExecutor {
         }
       }
     } finally {
+      cleanupSocketHandlers?.();
+
       if (isPrimaryExecution) {
         this.executingTasks.delete(taskId);
         logger.info(

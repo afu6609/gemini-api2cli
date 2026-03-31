@@ -224,6 +224,15 @@ export async function createApp() {
   expressApp.use(express.json({ limit: '200mb' }));
   expressApp.use(createPromptApiRouter());
 
+  const enableA2A = process.env['ENABLE_A2A'] === 'true';
+  if (!enableA2A) {
+    logger.info(
+      '[CoreAgent] A2A mode disabled (set ENABLE_A2A=true to enable). Running in prompt-api-only mode.',
+    );
+    registerUnavailableAgentRoutes(expressApp);
+    return expressApp;
+  }
+
   try {
     // Load the server configuration once on startup.
     const workspaceRoot = setTargetDir(undefined);
@@ -259,7 +268,7 @@ export async function createApp() {
       taskStoreForHandler = inMemoryTaskStore;
     }
 
-    const agentExecutor = new CoderAgentExecutor(taskStoreForExecutor);
+    const agentExecutor = new CoderAgentExecutor(taskStoreForExecutor, config);
 
     const context = { config, git, agentExecutor };
 

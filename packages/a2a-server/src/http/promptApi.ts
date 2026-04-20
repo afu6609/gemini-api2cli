@@ -37,6 +37,7 @@ import {
   getDisplayString,
   setupUser,
   type BucketInfo,
+  Config,
 } from '@google/gemini-cli-core';
 import { logger } from '../utils/logger.js';
 import {
@@ -713,7 +714,11 @@ async function getPromptApiCredentialQuotaPayload(
     const client = createPromptCredentialOAuthClient(state.settings.proxyUrl);
     client.setCredentials(credentials);
 
-    const userData = await setupUser(client);
+    // Headless shim: no interactive validation, telemetry is best-effort
+    const configShim = {
+      getValidationHandler: () => undefined,
+    } as unknown as Config;
+    const userData = await setupUser(client, configShim);
     const codeAssistServer = new CodeAssistServer(
       client,
       userData.projectId,

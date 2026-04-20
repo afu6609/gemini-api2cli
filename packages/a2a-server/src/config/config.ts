@@ -128,7 +128,10 @@ export async function loadConfig(
       process.env['https_proxy'] ||
       process.env['HTTP_PROXY'] ||
       process.env['http_proxy'],
-    interactive: !isHeadlessMode(),
+    // Keep upstream v0.38.1 fix: A2A server should always execute ask
+    // policies in interactive mode, regardless of headless detection
+    // (see upstream commit bf03543bf, PR #23831).
+    interactive: true,
     enableInteractiveShell: !isHeadlessMode(),
     ptyInfo: 'auto',
     enableAgents: settings.experimental?.enableAgents ?? true,

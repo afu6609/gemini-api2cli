@@ -608,25 +608,73 @@ function getPromptQuotaSummary(buckets: BucketInfo[] | undefined) {
       remainingFraction: number;
     } => typeof bucket.remainingFraction === 'number',
   );
-  const models = Array.from(
-    new Map(
-      normalizedBuckets
-        .filter(
-          (
-            bucket,
-          ): bucket is (typeof normalizedBuckets)[number] & {
-            modelId: string;
-          } => typeof bucket.modelId === 'string' && bucket.modelId.length > 0,
-        )
-        .map((bucket) => [
-          bucket.modelId,
-          {
-            id: bucket.modelId,
-            label: getDisplayString(bucket.modelId),
-          },
-        ]),
-    ).values(),
-  );
+  // Group buckets by modelId. When multiple buckets share the same modelId
+  // (e.g., different tokenType), pick the bucket that best represents the
+  // real limit for the dashboard:
+  //   1) lowest remainingFraction wins (most constraining)
+  //   2) on tie, prefer the bucket with richer data so the UI does not
+  //      fall back to "--" when another bucket carries numeric figures.
+  // This produces a lossy per-model summary (non-selected tokenType
+  // buckets are dropped); raw data remains available via quota.buckets.
+  type NormalizedBucket = (typeof normalizedBuckets)[number];
+  const bucketInfoScore = (bucket: NormalizedBucket) =>
+    (typeof bucket.remaining === 'number' ? 4 : 0) +
+    (typeof bucket.limit === 'number' ? 2 : 0) +
+    (typeof bucket.resetTime === 'string' && bucket.resetTime.length > 0
+      ? 1
+      : 0);
+  const modelBucketMap = new Map<string, NormalizedBucket>();
+  for (const bucket of normalizedBuckets) {
+    if (typeof bucket.modelId !== 'string' || bucket.modelId.length === 0) {
+      continue;
+    }
+    const existing = modelBucketMap.get(bucket.modelId);
+    if (!existing) {
+      modelBucketMap.set(bucket.modelId, bucket);
+      continue;
+    }
+    const existingFraction =
+      typeof existing.remainingFraction === 'number'
+        ? existing.remainingFraction
+        : Infinity;
+    const candidateFraction =
+      typeof bucket.remainingFraction === 'number'
+        ? bucket.remainingFraction
+        : Infinity;
+    if (candidateFraction < existingFraction) {
+      modelBucketMap.set(bucket.modelId, bucket);
+    } else if (
+      candidateFraction === existingFraction &&
+      bucketInfoScore(bucket) > bucketInfoScore(existing)
+    ) {
+      modelBucketMap.set(bucket.modelId, bucket);
+    }
+  }
+  const models = Array.from(modelBucketMap.values()).map((bucket) => {
+    const fraction = bucket.remainingFraction;
+    const remainingPercent =
+      typeof fraction === 'number'
+        ? Math.max(0, Math.min(100, Math.round(fraction * 100)))
+        : null;
+    const usedPercent =
+      typeof fraction === 'number'
+        ? Math.max(0, Math.min(100, Math.round((1 - fraction) * 100)))
+        : null;
+    return {
+      // Minimum fields (id, label) kept for backward compatibility with any
+      // consumer that only expected {id, label}. The extra fields below make
+      // per-model quota directly visible without going through totals.
+      id: bucket.modelId as string,
+      label: getDisplayString(bucket.modelId as string),
+      tokenType: bucket.tokenType,
+      remaining: bucket.remaining,
+      limit: bucket.limit,
+      remainingFraction: fraction,
+      remainingPercent,
+      usedPercent,
+      resetTime: bucket.resetTime,
+    };
+  });
   const totalRemaining = numericRemainingBuckets.reduce(
     (sum, bucket) => sum + bucket.remaining,
     0,

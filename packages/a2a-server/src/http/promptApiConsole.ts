@@ -134,6 +134,21 @@ a{color:var(--accent);text-decoration:none}
 .chip-row{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
 .chip{padding:4px 10px;border-radius:999px;font-size:11px;font-weight:600;background:var(--accent-glow);color:var(--accent);border:1px solid rgba(99,102,241,.2)}
 
+/* ── Per-Model Quota Rows ── */
+.model-quota-section{margin-top:14px;padding-top:14px;border-top:1px solid var(--border)}
+.model-quota-title{font-size:11px;font-weight:600;color:var(--text3);text-transform:uppercase;letter-spacing:.05em;margin-bottom:8px}
+.model-quota-row{display:grid;grid-template-columns:minmax(140px,1.2fr) minmax(90px,0.8fr) minmax(110px,1fr) minmax(100px,1fr);gap:10px;align-items:center;padding:8px 10px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);margin-bottom:6px;font-size:12px}
+.model-quota-row:last-child{margin-bottom:0}
+.model-quota-name{font-weight:600;color:var(--text1)}
+.model-quota-name small{display:block;color:var(--text3);font-size:10px;font-weight:400;margin-top:1px}
+.model-quota-num{font-family:var(--mono);font-size:11px;color:var(--text2)}
+.model-quota-bar{position:relative;height:6px;background:var(--surface2);border-radius:3px;overflow:hidden}
+.model-quota-bar-fill{position:absolute;inset:0;right:auto;background:linear-gradient(90deg,var(--accent) 0%,var(--accent) 100%);border-radius:3px;transition:width .3s}
+.model-quota-bar-fill.low{background:var(--red)}
+.model-quota-bar-fill.warn{background:#f59e0b}
+.model-quota-reset{color:var(--text3);font-size:11px}
+@media (max-width:640px){.model-quota-row{grid-template-columns:1fr 1fr;row-gap:6px}.model-quota-bar{grid-column:1/-1}.model-quota-reset{grid-column:1/-1}}
+
 /* ── Code Block ── */
 .code-block{background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius);padding:14px;font-family:var(--mono);font-size:12px;line-height:1.7;color:var(--text2);overflow-x:auto;white-space:pre-wrap;word-break:break-all;min-height:60px}
 
@@ -506,6 +521,7 @@ const I = {
     health: 'Health', cli: 'CLI', context: 'Context', model: 'Model', credential: 'Credential', acp: 'ACP',
     ok: 'OK', error: 'Error', built: 'Built', notBuilt: 'Not Built', isolated: 'Isolated', unknown: 'Unknown', none: 'None', on: 'On', off: 'Off',
     remaining: 'Remaining', numeric: 'Numeric', plan: 'Plan', credits: 'Credits', reset: 'Reset', models: 'Models',
+    modelQuotas: 'Per-Model Quotas', modelQuotasEmpty: 'No per-model data.',
     statusOk: 'OK', statusNotLoggedIn: 'Not Logged In', statusError: 'Error',
     tokenMgmt: 'Token Management',
     tokenMgmtDesc: 'Token applies to both Web console login and API request Authorization header.',
@@ -635,6 +651,7 @@ const I = {
     health: '健康状态', cli: 'CLI', context: '上下文', model: '模型', credential: '凭据', acp: 'ACP',
     ok: '正常', error: '异常', built: '已构建', notBuilt: '未构建', isolated: '隔离', unknown: '未知', none: '无', on: '已启用', off: '已关闭',
     remaining: '剩余比例', numeric: '数值额度', plan: '套餐', credits: '积分', reset: '重置时间', models: '模型数',
+    modelQuotas: '各模型配额', modelQuotasEmpty: '暂无各模型数据。',
     statusOk: '正常', statusNotLoggedIn: '未登录', statusError: '错误',
     tokenMgmt: '密钥管理',
     tokenMgmtDesc: '密钥同时用于 Web 管理页面登录和 API 请求的 Authorization 请求头鉴权。',
@@ -958,12 +975,10 @@ function renderQuotas(payload) {
     const tot = e.quotaSummary?.totals || {};
     const models = e.quotaSummary?.models || [];
     const plan = e.userTierName || e.userTier || '--';
-    const chips = models.length
-      ? '<div class="chip-row">'+models.map(m=>'<span class="chip">'+esc(m.label||m.id)+'</span>').join('')+'</div>'
-      : '';
     const statusBadge = e.status === 'ok'
       ? '<span class="badge badge-active">'+esc(t('statusOk'))+'</span>'
       : '<span class="badge badge-stored">'+esc(localeStatus(e.status))+'</span>';
+    const modelSection = e.status === 'ok' ? renderModelQuotaSection(models) : '';
     return '<div class="quota-card">'+
       '<div style="display:flex;justify-content:space-between;align-items:flex-start">'+
         '<div><strong>'+esc(e.credential.label)+'</strong>'+
@@ -978,10 +993,44 @@ function renderQuotas(payload) {
         metric(t('reset'), fmtDate(tot.resetTime))+
         metric(t('models'), String(tot.modelCount??models.length??'--'))+
       '</div>'+
-      chips+
+      modelSection+
       (e.error?'<div style="margin-top:8px;color:var(--red);font-size:12px">'+esc(e.error)+'</div>':'')+
     '</div>';
   }).join('');
+}
+
+/* Render per-model quota rows. Each row shows model name, numeric
+   remaining/limit, a fill bar for remainingPercent, and reset time. */
+function renderModelQuotaSection(models) {
+  if (!Array.isArray(models) || !models.length) {
+    return '<div class="model-quota-section"><div class="model-quota-title">'+esc(t('modelQuotas'))+'</div>'+
+      '<div class="empty" style="padding:10px">'+esc(t('modelQuotasEmpty'))+'</div></div>';
+  }
+  const rows = models.map(m => {
+    const pct = typeof m.remainingPercent === 'number' ? m.remainingPercent : null;
+    const barClass = pct===null ? '' : (pct<=10 ? ' low' : (pct<=25 ? ' warn' : ''));
+    const barWidth = pct===null ? 0 : pct;
+    const barHtml = '<div class="model-quota-bar" title="'+(pct===null?'--':pct+'%')+'">'+
+      '<div class="model-quota-bar-fill'+barClass+'" style="width:'+barWidth+'%"></div></div>';
+    const tokenTypeLabel = m.tokenType ? '<small>'+esc(String(m.tokenType))+'</small>' : '';
+    const nameCell = '<div class="model-quota-name">'+esc(m.label||m.id)+tokenTypeLabel+'</div>';
+    const numCell = '<div class="model-quota-num">'+esc(fmtModelCount(m))+'</div>';
+    const resetCell = '<div class="model-quota-reset">'+esc(fmtDate(m.resetTime))+'</div>';
+    return '<div class="model-quota-row">'+nameCell+numCell+barHtml+resetCell+'</div>';
+  }).join('');
+  return '<div class="model-quota-section">'+
+    '<div class="model-quota-title">'+esc(t('modelQuotas'))+'</div>'+
+    rows+
+  '</div>';
+}
+
+function fmtModelCount(m) {
+  if (typeof m.remaining === 'number' && typeof m.limit === 'number' && m.limit > 0) {
+    return m.remaining + ' / ' + m.limit;
+  }
+  if (typeof m.remaining === 'number') return String(m.remaining);
+  if (typeof m.remainingPercent === 'number') return m.remainingPercent + '%';
+  return '--';
 }
 
 function metric(label, value) {

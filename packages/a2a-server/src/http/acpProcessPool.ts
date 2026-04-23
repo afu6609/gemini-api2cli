@@ -679,6 +679,17 @@ export class AcpProcessPool {
   }
 
   /**
+   * Speculative lookup: returns the worker for the given credential only if
+   * it is already in 'ready' state. Never evicts, never spawns — callers use
+   * this for opportunistic operations (e.g. credential prefetch) where a
+   * cache miss must NOT impact other in-flight requests.
+   */
+  getReadyWorker(credentialId: string): AcpWorker | undefined {
+    const worker = this.workers.get(credentialId);
+    return worker && worker.state === 'ready' ? worker : undefined;
+  }
+
+  /**
    * Pre-warm a worker for the given credential so the first request avoids cold start.
    */
   async warmUp(

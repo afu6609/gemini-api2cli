@@ -37,7 +37,7 @@ import {
   getDisplayString,
   setupUser,
   type BucketInfo,
-  Config,
+  type Config,
 } from '@google/gemini-cli-core';
 import { logger } from '../utils/logger.js';
 import {
@@ -617,17 +617,22 @@ function getPromptQuotaSummary(buckets: BucketInfo[] | undefined) {
   // This produces a lossy per-model summary (non-selected tokenType
   // buckets are dropped); raw data remains available via quota.buckets.
   type NormalizedBucket = (typeof normalizedBuckets)[number];
+  // Narrow modelId at the type level so downstream code never needs `as string`.
+  type BucketWithModelId = NormalizedBucket & { modelId: string };
+  const hasStringModelId = (
+    bucket: NormalizedBucket,
+  ): bucket is BucketWithModelId =>
+    typeof bucket.modelId === 'string' && bucket.modelId.length > 0;
+
   const bucketInfoScore = (bucket: NormalizedBucket) =>
     (typeof bucket.remaining === 'number' ? 4 : 0) +
     (typeof bucket.limit === 'number' ? 2 : 0) +
     (typeof bucket.resetTime === 'string' && bucket.resetTime.length > 0
       ? 1
       : 0);
-  const modelBucketMap = new Map<string, NormalizedBucket>();
+  const modelBucketMap = new Map<string, BucketWithModelId>();
   for (const bucket of normalizedBuckets) {
-    if (typeof bucket.modelId !== 'string' || bucket.modelId.length === 0) {
-      continue;
-    }
+    if (!hasStringModelId(bucket)) continue;
     const existing = modelBucketMap.get(bucket.modelId);
     if (!existing) {
       modelBucketMap.set(bucket.modelId, bucket);
@@ -664,8 +669,8 @@ function getPromptQuotaSummary(buckets: BucketInfo[] | undefined) {
       // Minimum fields (id, label) kept for backward compatibility with any
       // consumer that only expected {id, label}. The extra fields below make
       // per-model quota directly visible without going through totals.
-      id: bucket.modelId as string,
-      label: getDisplayString(bucket.modelId as string),
+      id: bucket.modelId,
+      label: getDisplayString(bucket.modelId),
       tokenType: bucket.tokenType,
       remaining: bucket.remaining,
       limit: bucket.limit,
@@ -762,7 +767,11 @@ async function getPromptApiCredentialQuotaPayload(
     const client = createPromptCredentialOAuthClient(state.settings.proxyUrl);
     client.setCredentials(credentials);
 
-    // Headless shim: no interactive validation, telemetry is best-effort
+    // Headless shim: no interactive validation, telemetry is best-effort.
+    // setupUser's signature demands a full Config, but in v0.38.1 it only
+    // invokes getValidationHandler(). Supplying a minimal shim avoids
+    // instantiating the heavy Config graph just to fetch the user profile.
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
     const configShim = {
       getValidationHandler: () => undefined,
     } as unknown as Config;
@@ -1598,7 +1607,10 @@ function extractErrorMessage(err: unknown): string {
   if (typeof err === 'object' && err !== null) {
     // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
     const obj = err as Record<string, unknown>;
-    if (typeof obj['message'] === 'string') return obj['message'];
+    // Pull the candidate out to a local so the typeof check operates on a
+    // plain variable (no-restricted-syntax forbids typeof on obj properties).
+    const candidate = obj['message'];
+    if (typeof candidate === 'string') return candidate;
     try {
       return JSON.stringify(err);
     } catch {
@@ -1606,6 +1618,175 @@ function extractErrorMessage(err: unknown): string {
     }
   }
   return String(err);
+}
+
+/* ── Credential prefetch (failover latency optimization) ── */
+
+type PrefetchedSession = {
+  worker: Awaited<ReturnType<typeof getAcpWorkerAndSession>>['worker'];
+  sessionId: string;
+  credentialId: string;
+};
+
+type PrefetchPromise = Promise<PrefetchedSession | null>;
+
+type PrefetchRef = { current: PrefetchPromise | null };
+
+/**
+ * Speculative lookup: pick the first non-excluded, non-cooled-down credential
+ * that already has a READY worker in the pool, and create a session on it.
+ *
+ * Unlike `getAcpWorkerAndSessionExcluding`, this NEVER calls `getOrCreate`,
+ * which means it cannot:
+ *   - Spawn a new worker (cold start — would cost 2-5s, wasted if prefetch
+ *     goes unused; also uncertain whether the request will actually fail over)
+ *   - Evict another worker at capacity (would break in-flight requests served
+ *     by that worker — see AcpProcessPool.getOrCreate fallback path)
+ *
+ * Returns null when no ready worker is available — caller falls back to the
+ * synchronous `getAcpWorkerAndSessionExcluding` path, which is willing to
+ * pay the cold-start/evict cost since the request is already failing over.
+ */
+async function speculativeWorkerAndSession(
+  deps: Required<PromptApiDependencies>,
+  state: PromptApiState,
+  excludeCredentialIds: Set<string>,
+): Promise<PrefetchedSession | null> {
+  void deps;
+  pruneCredentialCooldowns(state);
+  const credentials = await state.credentialStore.listCredentials();
+  for (const cred of credentials) {
+    if (excludeCredentialIds.has(cred.id)) continue;
+    if (state.credentialCooldowns.has(cred.id)) continue;
+    const worker = state.acpPool.getReadyWorker(cred.id);
+    if (!worker) continue;
+    try {
+      const sessionId = await worker.createSession();
+      return { worker, sessionId, credentialId: cred.id };
+    } catch {
+      continue;
+    }
+  }
+  return null;
+}
+
+/**
+ * Schedule a prefetch for the next credential's session. Stores the in-flight
+ * promise in `prefetchRef.current` so consumers can `await` it on failover.
+ *
+ * Self-clearing behavior: if the prefetch resolves to null (no ready worker
+ * available, error, etc.) AND it is still the active prefetch in the ref,
+ * the slot is vacated so a later attempt can start a fresh prefetch instead
+ * of sitting on a dead Promise.
+ */
+function schedulePrefetch(
+  deps: Required<PromptApiDependencies>,
+  state: PromptApiState,
+  excludeCredentialIds: Set<string>,
+  prefetchRef: PrefetchRef,
+): void {
+  // Snapshot the excluded set — the caller's set may mutate while we wait.
+  const snapshot = new Set(excludeCredentialIds);
+  const promise: PrefetchPromise = speculativeWorkerAndSession(
+    deps,
+    state,
+    snapshot,
+  ).catch((err) => {
+    logger.debug(
+      `[ACP] Prefetch next credential failed: ${extractErrorMessage(err)}`,
+    );
+    return null;
+  });
+  prefetchRef.current = promise;
+  // Self-clear on null result so later attempts can re-schedule.
+  void promise.then((result) => {
+    if (!result && prefetchRef.current === promise) {
+      prefetchRef.current = null;
+    }
+  });
+}
+
+/**
+ * Consume a prefetch promise: returns its resolved value (null on failure)
+ * and clears the caller's reference so the same prefetch can't be used twice.
+ *
+ * If the prefetch is still in-flight, this awaits it — but since it was
+ * started in parallel with the previous attempt, most of that wait has
+ * already been absorbed.
+ */
+async function consumePrefetch(
+  ref: PrefetchRef,
+): Promise<PrefetchedSession | null> {
+  const pending = ref.current;
+  ref.current = null;
+  if (!pending) return null;
+  try {
+    return await pending;
+  } catch {
+    // schedulePrefetch already catches, but guard defensively.
+    return null;
+  }
+}
+
+/**
+ * Validate that a prefetched session is still usable against the current
+ * shared state (other concurrent requests may have cooled down this
+ * credential, or our own attempt may have tried it already).
+ *
+ * On rejection, destroys the prefetched session to avoid leaks.
+ */
+function acceptPrefetched(
+  prefetched: PrefetchedSession | null,
+  triedCredentials: Set<string>,
+  state: PromptApiState,
+): PrefetchedSession | null {
+  if (!prefetched) return null;
+  pruneCredentialCooldowns(state);
+  const credId = prefetched.credentialId;
+  // Reject when:
+  //   - This attempt already tried this credential (shouldn't happen given
+  //     the prefetch excluded set, but guard against set-mutation races).
+  //   - Another concurrent request cooled down this credential while we waited.
+  //   - The worker died between prefetch success and consumption.
+  const stale =
+    triedCredentials.has(credId) ||
+    state.credentialCooldowns.has(credId) ||
+    prefetched.worker.state !== 'ready';
+  if (stale) {
+    try {
+      prefetched.worker.destroySession(prefetched.sessionId);
+    } catch (err) {
+      logger.debug(
+        `[ACP] Failed to destroy stale prefetched session: ${extractErrorMessage(err)}`,
+      );
+    }
+    return null;
+  }
+  return prefetched;
+}
+
+/**
+ * Fire-and-forget cleanup: destroys the session created by an unused prefetch.
+ * Called on the happy path (no failover needed) to avoid leaking sessions.
+ */
+function discardPrefetch(ref: PrefetchRef): void {
+  const pending = ref.current;
+  ref.current = null;
+  if (!pending) return;
+  pending
+    .then((session) => {
+      if (!session) return;
+      try {
+        session.worker.destroySession(session.sessionId);
+      } catch (err) {
+        logger.debug(
+          `[ACP] Failed to destroy unused prefetched session: ${extractErrorMessage(err)}`,
+        );
+      }
+    })
+    .catch(() => {
+      /* swallow — already logged upstream */
+    });
 }
 
 async function handleAcpJsonRequest(
@@ -1629,107 +1810,137 @@ async function handleAcpJsonRequest(
   const triedCredentials = new Set<string>();
   let lastError = '';
 
-  for (let attempt = 0; attempt < maxAttempts; attempt++) {
-    let worker: Awaited<ReturnType<typeof getAcpWorkerAndSession>>['worker'];
-    let sessionId: string;
+  // Prefetch slot: holds the in-flight "next credential" promise so failover
+  // doesn't pay the createSession latency serially. See schedulePrefetch.
+  const prefetchRef: PrefetchRef = { current: null };
 
-    try {
-      if (attempt === 0) {
-        const result = await getAcpWorkerAndSession(deps, state);
-        worker = result.worker;
-        sessionId = result.sessionId;
-        triedCredentials.add(result.credentialId);
-      } else {
-        // Failover: try a different credential
-        const alt = await getAcpWorkerAndSessionExcluding(
-          deps,
-          state,
-          triedCredentials,
-        );
-        if (!alt) {
-          logger.warn(
-            `[ACP] No more credentials available for failover (attempt ${attempt + 1})`,
-          );
-          break;
-        }
-        worker = alt.worker;
-        sessionId = alt.sessionId;
-        triedCredentials.add(alt.credentialId);
-        logger.info(
-          `[ACP] Failover attempt ${attempt + 1}: switching to credential ${alt.credentialId}`,
-        );
-      }
-    } catch (err) {
-      lastError = extractErrorMessage(err);
-      logger.error(`[ACP] Failed to get worker/session: ${lastError}`);
-      continue;
-    }
+  try {
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      let worker: Awaited<ReturnType<typeof getAcpWorkerAndSession>>['worker'];
+      let sessionId: string;
 
-    if (parsed.model) {
       try {
-        await worker.setSessionModel(sessionId, model);
-      } catch (err) {
-        logger.warn(
-          `[ACP] Failed to set model to ${model}: ${extractErrorMessage(err)}`,
-        );
-      }
-    }
-
-    try {
-      let assistantText = '';
-      await worker.prompt(
-        sessionId,
-        contentBlocks,
-        (update: SessionNotification) => {
-          if (
-            update.update.sessionUpdate === 'agent_message_chunk' &&
-            update.update.content.type === 'text'
-          ) {
-            assistantText += update.update.content.text;
+        if (attempt === 0) {
+          const result = await getAcpWorkerAndSession(deps, state);
+          worker = result.worker;
+          sessionId = result.sessionId;
+          triedCredentials.add(result.credentialId);
+        } else {
+          // Failover: prefer the prefetched session (already warmed in parallel
+          // with the previous attempt) to eliminate serial createSession latency.
+          // acceptPrefetched re-checks cooldown state because other concurrent
+          // requests may have marked this credential unhealthy while we waited.
+          const prefetched = await consumePrefetch(prefetchRef);
+          let alt: PrefetchedSession | null = acceptPrefetched(
+            prefetched,
+            triedCredentials,
+            state,
+          );
+          const usedPrefetch = alt !== null;
+          if (!alt) {
+            // No valid prefetch — fall back to synchronous lookup. This path
+            // is willing to spawn/evict workers since we're actively failing over.
+            alt = await getAcpWorkerAndSessionExcluding(
+              deps,
+              state,
+              triedCredentials,
+            );
           }
+          if (!alt) {
+            logger.warn(
+              `[ACP] No more credentials available for failover (attempt ${attempt + 1})`,
+            );
+            break;
+          }
+          worker = alt.worker;
+          sessionId = alt.sessionId;
+          triedCredentials.add(alt.credentialId);
+          logger.info(
+            `[ACP] Failover attempt ${attempt + 1}: switching to credential ${alt.credentialId}${usedPrefetch ? ' (prefetched)' : ''}`,
+          );
+        }
 
-          logger.info(`[ACP] chunk: ${JSON.stringify(update)}\n`);
-        },
-      );
+        // Kick off prefetch for the *next* attempt in parallel with the
+        // current prompt. Only when more retries remain and no prefetch is
+        // already in flight (schedulePrefetch self-clears on null results).
+        if (attempt + 1 < maxAttempts && !prefetchRef.current) {
+          schedulePrefetch(deps, state, triedCredentials, prefetchRef);
+        }
+      } catch (err) {
+        lastError = extractErrorMessage(err);
+        logger.error(`[ACP] Failed to get worker/session: ${lastError}`);
+        continue;
+      }
 
-      return res
-        .status(200)
-        .json(adapter.buildJsonResponse(assistantText, model, requestId));
-    } catch (err) {
-      lastError = extractErrorMessage(err);
-      logger.error(
-        `[ACP] Prompt error (attempt ${attempt + 1}/${maxAttempts}): ${lastError}`,
-      );
+      if (parsed.model) {
+        try {
+          await worker.setSessionModel(sessionId, model);
+        } catch (err) {
+          logger.warn(
+            `[ACP] Failed to set model to ${model}: ${extractErrorMessage(err)}`,
+          );
+        }
+      }
 
-      // Mark credential as unhealthy and failover on credential/quota errors
-      if (isCredentialFailoverError(err)) {
-        state.credentialCooldowns.set(worker.credentialId, Date.now());
-        logger.info(
-          `[ACP] Credential ${worker.credentialId} cooled down for ${CREDENTIAL_COOLDOWN_MS / 1000}s`,
+      try {
+        let assistantText = '';
+        await worker.prompt(
+          sessionId,
+          contentBlocks,
+          (update: SessionNotification) => {
+            if (
+              update.update.sessionUpdate === 'agent_message_chunk' &&
+              update.update.content.type === 'text'
+            ) {
+              assistantText += update.update.content.text;
+            }
+
+            logger.info(`[ACP] chunk: ${JSON.stringify(update)}\n`);
+          },
         );
-      }
-      if (!isCredentialFailoverError(err) || attempt + 1 >= maxAttempts) {
+
         return res
-          .status(500)
-          .json(adapter.buildJsonError(lastError, 500, model, requestId));
-      }
-    } finally {
-      if (worker && sessionId) {
-        worker.destroySession(sessionId);
+          .status(200)
+          .json(adapter.buildJsonResponse(assistantText, model, requestId));
+      } catch (err) {
+        lastError = extractErrorMessage(err);
+        logger.error(
+          `[ACP] Prompt error (attempt ${attempt + 1}/${maxAttempts}): ${lastError}`,
+        );
+
+        // Mark credential as unhealthy and failover on credential/quota errors
+        if (isCredentialFailoverError(err)) {
+          state.credentialCooldowns.set(worker.credentialId, Date.now());
+          logger.info(
+            `[ACP] Credential ${worker.credentialId} cooled down for ${CREDENTIAL_COOLDOWN_MS / 1000}s`,
+          );
+        }
+        if (!isCredentialFailoverError(err) || attempt + 1 >= maxAttempts) {
+          return res
+            .status(500)
+            .json(adapter.buildJsonError(lastError, 500, model, requestId));
+        }
+      } finally {
+        if (worker && sessionId) {
+          worker.destroySession(sessionId);
+        }
       }
     }
-  }
 
-  return res
-    .status(500)
-    .json(
-      adapter.buildJsonError(
-        lastError || 'All credentials exhausted.',
-        500,
-        model,
-        requestId,
-      ),
-    );
+    return res
+      .status(500)
+      .json(
+        adapter.buildJsonError(
+          lastError || 'All credentials exhausted.',
+          500,
+          model,
+          requestId,
+        ),
+      );
+  } finally {
+    // Clean up any unused prefetched session (happy path or early break).
+    discardPrefetch(prefetchRef);
+  }
 }
 
 async function handleAcpStreamingRequest(
@@ -1754,145 +1965,170 @@ async function handleAcpStreamingRequest(
   let lastError = '';
   let headersSent = false;
 
-  for (let attempt = 0; attempt < maxAttempts; attempt++) {
-    let worker: Awaited<ReturnType<typeof getAcpWorkerAndSession>>['worker'];
-    let sessionId: string;
+  // Prefetch slot for failover — see handleAcpJsonRequest for details.
+  const prefetchRef: PrefetchRef = { current: null };
 
-    try {
-      if (attempt === 0) {
-        const result = await getAcpWorkerAndSession(deps, state);
-        worker = result.worker;
-        sessionId = result.sessionId;
-        triedCredentials.add(result.credentialId);
-      } else {
-        const alt = await getAcpWorkerAndSessionExcluding(
-          deps,
-          state,
-          triedCredentials,
-        );
-        if (!alt) {
-          logger.warn(
-            `[ACP] No more credentials available for failover (stream, attempt ${attempt + 1})`,
-          );
-          break;
-        }
-        worker = alt.worker;
-        sessionId = alt.sessionId;
-        triedCredentials.add(alt.credentialId);
-        logger.info(
-          `[ACP] Stream failover attempt ${attempt + 1}: switching to credential ${alt.credentialId}`,
-        );
-      }
-    } catch (err) {
-      lastError = extractErrorMessage(err);
-      logger.error(`[ACP] Failed to get worker/session (stream): ${lastError}`);
-      continue;
-    }
+  try {
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      let worker: Awaited<ReturnType<typeof getAcpWorkerAndSession>>['worker'];
+      let sessionId: string;
 
-    if (parsed.model) {
       try {
-        await worker.setSessionModel(sessionId, model);
-      } catch (err) {
-        logger.warn(
-          `[ACP] Failed to set model to ${model}: ${extractErrorMessage(err)}`,
-        );
-      }
-    }
-
-    // Start streaming headers (only on first successful attempt)
-    if (!headersSent) {
-      res.setHeader('Content-Type', adapter.streamContentType);
-      res.setHeader('Cache-Control', 'no-cache, no-transform');
-      res.setHeader('X-Accel-Buffering', 'no');
-      res.flushHeaders();
-      headersSent = true;
-    }
-
-    let isFirst = true;
-    let cancelled = false;
-
-    const abortHandler = () => {
-      cancelled = true;
-      worker.cancelPrompt(sessionId).catch(() => {});
-    };
-    req.on('aborted', abortHandler);
-    res.on('close', abortHandler);
-
-    try {
-      await worker.prompt(
-        sessionId,
-        contentBlocks,
-        (update: SessionNotification) => {
-          if (cancelled) return;
-          if (
-            update.update.sessionUpdate === 'agent_message_chunk' &&
-            update.update.content.type === 'text'
-          ) {
-            res.write(
-              adapter.formatStreamChunk(
-                update.update.content.text,
-                model,
-                requestId,
-                isFirst,
-              ),
+        if (attempt === 0) {
+          const result = await getAcpWorkerAndSession(deps, state);
+          worker = result.worker;
+          sessionId = result.sessionId;
+          triedCredentials.add(result.credentialId);
+        } else {
+          const prefetched = await consumePrefetch(prefetchRef);
+          let alt: PrefetchedSession | null = acceptPrefetched(
+            prefetched,
+            triedCredentials,
+            state,
+          );
+          const usedPrefetch = alt !== null;
+          if (!alt) {
+            alt = await getAcpWorkerAndSessionExcluding(
+              deps,
+              state,
+              triedCredentials,
             );
-            isFirst = false;
           }
-        },
-      );
-
-      if (!cancelled) {
-        res.write(adapter.formatStreamEnd(model, requestId));
-      }
-      // Success — clean up and return
-      req.off('aborted', abortHandler);
-      res.off('close', abortHandler);
-      worker.destroySession(sessionId);
-      res.end();
-      return;
-    } catch (err) {
-      req.off('aborted', abortHandler);
-      res.off('close', abortHandler);
-      worker.destroySession(sessionId);
-
-      lastError = extractErrorMessage(err);
-      logger.error(
-        `[ACP] Prompt error (stream, attempt ${attempt + 1}/${maxAttempts}): ${lastError}`,
-      );
-
-      // Mark credential as unhealthy on failover-eligible errors
-      if (isCredentialFailoverError(err)) {
-        state.credentialCooldowns.set(worker.credentialId, Date.now());
-        logger.info(
-          `[ACP] Credential ${worker.credentialId} cooled down for ${CREDENTIAL_COOLDOWN_MS / 1000}s`,
-        );
-      }
-
-      // Can only failover if no chunks were sent yet
-      if (!isFirst || cancelled || !isCredentialFailoverError(err)) {
-        if (!cancelled) {
-          res.write(adapter.formatStreamError(lastError, model, requestId));
+          if (!alt) {
+            logger.warn(
+              `[ACP] No more credentials available for failover (stream, attempt ${attempt + 1})`,
+            );
+            break;
+          }
+          worker = alt.worker;
+          sessionId = alt.sessionId;
+          triedCredentials.add(alt.credentialId);
+          logger.info(
+            `[ACP] Stream failover attempt ${attempt + 1}: switching to credential ${alt.credentialId}${usedPrefetch ? ' (prefetched)' : ''}`,
+          );
         }
+
+        // Prefetch for the next potential failover — runs concurrently with
+        // the current stream so a second 429 switches over instantly.
+        if (attempt + 1 < maxAttempts && !prefetchRef.current) {
+          schedulePrefetch(deps, state, triedCredentials, prefetchRef);
+        }
+      } catch (err) {
+        lastError = extractErrorMessage(err);
+        logger.error(
+          `[ACP] Failed to get worker/session (stream): ${lastError}`,
+        );
+        continue;
+      }
+
+      if (parsed.model) {
+        try {
+          await worker.setSessionModel(sessionId, model);
+        } catch (err) {
+          logger.warn(
+            `[ACP] Failed to set model to ${model}: ${extractErrorMessage(err)}`,
+          );
+        }
+      }
+
+      // Start streaming headers (only on first successful attempt)
+      if (!headersSent) {
+        res.setHeader('Content-Type', adapter.streamContentType);
+        res.setHeader('Cache-Control', 'no-cache, no-transform');
+        res.setHeader('X-Accel-Buffering', 'no');
+        res.flushHeaders();
+        headersSent = true;
+      }
+
+      let isFirst = true;
+      let cancelled = false;
+
+      const abortHandler = () => {
+        cancelled = true;
+        worker.cancelPrompt(sessionId).catch(() => {});
+      };
+      req.on('aborted', abortHandler);
+      res.on('close', abortHandler);
+
+      try {
+        await worker.prompt(
+          sessionId,
+          contentBlocks,
+          (update: SessionNotification) => {
+            if (cancelled) return;
+            if (
+              update.update.sessionUpdate === 'agent_message_chunk' &&
+              update.update.content.type === 'text'
+            ) {
+              res.write(
+                adapter.formatStreamChunk(
+                  update.update.content.text,
+                  model,
+                  requestId,
+                  isFirst,
+                ),
+              );
+              isFirst = false;
+            }
+          },
+        );
+
+        if (!cancelled) {
+          res.write(adapter.formatStreamEnd(model, requestId));
+        }
+        // Success — clean up and return
+        req.off('aborted', abortHandler);
+        res.off('close', abortHandler);
+        worker.destroySession(sessionId);
         res.end();
         return;
-      }
-      // isFirst=true means no chunks sent, safe to retry with next credential
-    }
-  }
+      } catch (err) {
+        req.off('aborted', abortHandler);
+        res.off('close', abortHandler);
+        worker.destroySession(sessionId);
 
-  // All attempts exhausted
-  if (!headersSent) {
-    res.setHeader('Content-Type', adapter.streamContentType);
-    res.flushHeaders();
+        lastError = extractErrorMessage(err);
+        logger.error(
+          `[ACP] Prompt error (stream, attempt ${attempt + 1}/${maxAttempts}): ${lastError}`,
+        );
+
+        // Mark credential as unhealthy on failover-eligible errors
+        if (isCredentialFailoverError(err)) {
+          state.credentialCooldowns.set(worker.credentialId, Date.now());
+          logger.info(
+            `[ACP] Credential ${worker.credentialId} cooled down for ${CREDENTIAL_COOLDOWN_MS / 1000}s`,
+          );
+        }
+
+        // Can only failover if no chunks were sent yet
+        if (!isFirst || cancelled || !isCredentialFailoverError(err)) {
+          if (!cancelled) {
+            res.write(adapter.formatStreamError(lastError, model, requestId));
+          }
+          res.end();
+          return;
+        }
+        // isFirst=true means no chunks sent, safe to retry with next credential
+      }
+    }
+
+    // All attempts exhausted
+    if (!headersSent) {
+      res.setHeader('Content-Type', adapter.streamContentType);
+      res.flushHeaders();
+    }
+    res.write(
+      adapter.formatStreamError(
+        lastError || 'All credentials exhausted.',
+        model,
+        requestId,
+      ),
+    );
+    res.end();
+  } finally {
+    // Clean up any unused prefetched session (happy path or early break).
+    discardPrefetch(prefetchRef);
   }
-  res.write(
-    adapter.formatStreamError(
-      lastError || 'All credentials exhausted.',
-      model,
-      requestId,
-    ),
-  );
-  res.end();
 }
 
 async function handleAdaptedJsonRequest(

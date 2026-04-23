@@ -58,8 +58,18 @@ export function setOpenApiEnabled(enabled: boolean): void {
 /**
  * Routes that are exempt from auth — the console page itself handles login
  * client-side and the auth check endpoint needs to be reachable.
+ *
+ * `/v1/logs/stream` is listed here because it uses its own short-lived
+ * single-use ticket for authentication (see promptApi.ts). The ticket is
+ * issued via `POST /v1/logs/stream-ticket`, which DOES go through this
+ * middleware and requires a valid Bearer token.
  */
-const PUBLIC_PATHS = new Set(['/manage', '/v1/auth/check', '/v1/auth/login']);
+const PUBLIC_PATHS = new Set([
+  '/manage',
+  '/v1/auth/check',
+  '/v1/auth/login',
+  '/v1/logs/stream',
+]);
 
 /** API paths that can be bypassed when openApi is enabled */
 const API_PATH_PREFIXES = [

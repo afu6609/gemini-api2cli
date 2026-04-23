@@ -174,6 +174,41 @@ a{color:var(--accent);text-decoration:none}
 @media(max-width:860px){
   .grid-2,.grid-3,.grid-23,.grid-32{grid-template-columns:1fr}
 }
+
+/* ── Logs Panel ── */
+.logs-card{position:relative}
+.logs-head{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.logs-head .spacer{flex:1}
+.logs-toolbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:12px 0}
+.logs-toolbar select,.logs-toolbar input{background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:6px 10px;border-radius:8px;font:13px var(--sans);outline:none}
+.logs-toolbar select:focus,.logs-toolbar input:focus{border-color:var(--accent)}
+.logs-toolbar .search{flex:1;min-width:160px}
+.logs-toolbar .counter{font-size:12px;color:var(--text3);font-family:var(--mono)}
+.logs-body{background:var(--surface2);border:1px solid var(--border);border-radius:10px;height:360px;overflow-y:auto;padding:6px;font:12px/1.55 var(--mono);scrollbar-width:thin}
+.logs-body::-webkit-scrollbar{width:8px}
+.logs-body::-webkit-scrollbar-thumb{background:var(--border2);border-radius:4px}
+.logs-body.paused{box-shadow:inset 0 0 0 1px var(--amber)}
+.log-row{display:grid;grid-template-columns:78px 54px 1fr;gap:8px;padding:3px 6px;border-radius:6px;word-break:break-word;white-space:pre-wrap}
+.log-row:hover{background:var(--surface3)}
+.log-row.lv-error{color:var(--red)}
+.log-row.lv-warn{color:var(--amber)}
+.log-row.lv-info{color:var(--text)}
+.log-row.lv-debug{color:var(--text3)}
+.log-ts{color:var(--text3);font-variant-numeric:tabular-nums}
+.log-lv{font-weight:600;text-transform:uppercase;font-size:10px;letter-spacing:.5px;align-self:center;padding:1px 6px;border-radius:4px;text-align:center}
+.log-row.lv-error .log-lv{background:var(--red-bg);color:var(--red)}
+.log-row.lv-warn .log-lv{background:var(--amber-bg);color:var(--amber)}
+.log-row.lv-info .log-lv{background:var(--accent-glow);color:var(--accent)}
+.log-row.lv-debug .log-lv{background:var(--surface3);color:var(--text3)}
+.log-msg{min-width:0}
+.log-rest{display:block;margin-top:2px;color:var(--text3);font-size:11px;opacity:.85}
+.logs-empty{color:var(--text3);padding:16px;text-align:center;font-size:13px}
+.logs-stream-dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--green);animation:pulse 1.6s ease-in-out infinite}
+.logs-stream-dot.off{background:var(--text3);animation:none}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+@media(max-width:640px){
+  .log-row{grid-template-columns:68px 48px 1fr;font-size:11px}
+}
 </style>
 </head>
 <body>
@@ -406,7 +441,7 @@ a{color:var(--accent);text-decoration:none}
           <div class="field">
             <span class="label" id="t-acp-idle-label">Idle Timeout (seconds)</span>
             <div class="row" style="gap:8px;align-items:center">
-              <input type="number" id="acp-idle-input" class="input" style="width:100px" min="0" step="30" value="300"/>
+              <input type="number" id="acp-idle-input" class="input" style="width:100px" min="0" step="30" value="0"/>
               <span class="toggle-hint" id="t-acp-idle-hint" style="margin-left:0">0 = never timeout</span>
             </div>
           </div>
@@ -436,6 +471,30 @@ a{color:var(--accent);text-decoration:none}
     <div class="card-desc" id="t-api-desc">All endpoints require <code style="color:var(--accent)">Authorization: Bearer &lt;token&gt;</code> header.</div>
     <div id="ep-list"></div>
   </div>
+
+  <!-- Row 6: Logs Panel (collapsible) -->
+  <details class="card logs-card" id="logs-card" style="margin-top:16px">
+    <summary style="cursor:pointer;list-style:none;display:flex;align-items:center;gap:10px">
+      <span class="card-title" style="margin:0" id="t-logs">Logs</span>
+      <span class="logs-stream-dot off" id="logs-stream-dot" title="Live stream"></span>
+      <span class="spacer" style="flex:1"></span>
+      <span style="font-size:12px;color:var(--text3)" id="t-logs-toggle">Click to expand</span>
+    </summary>
+    <div class="card-desc" id="t-logs-desc" style="margin-top:8px">Recent server logs (in-memory ring buffer). Secrets are redacted before being shown here.</div>
+    <div class="logs-toolbar">
+      <select id="logs-level">
+        <option value="info" id="logs-level-info">Info+</option>
+        <option value="warn" id="logs-level-warn">Warn+</option>
+        <option value="error" id="logs-level-error">Error only</option>
+        <option value="debug" id="logs-level-debug">All (debug)</option>
+      </select>
+      <input id="logs-search" class="search" type="search" placeholder="Filter..."/>
+      <button class="btn btn-outline btn-sm" id="logs-pause-btn">Pause</button>
+      <button class="btn btn-outline btn-sm" id="logs-clear-btn">Clear</button>
+      <span class="counter" id="logs-counter">0</span>
+    </div>
+    <div class="logs-body" id="logs-body"></div>
+  </details>
 
   <div class="footer">
     <div id="footer-license-1"><strong>License:</strong> Upstream Gemini CLI code remains Apache-2.0.</div>
@@ -591,6 +650,22 @@ const I = {
     epQuotas: 'Get quotas for all credentials.',
     epQuota: 'Get quota for a specific credential.',
     epHealth: 'Health check.',
+    logs: 'Logs',
+    logsToggleCollapsed: 'Click to expand',
+    logsToggleExpanded: 'Click to collapse',
+    logsDesc: 'Recent server logs (in-memory ring buffer). Secrets are redacted before being shown here.',
+    logsLevelInfo: 'Info+',
+    logsLevelWarn: 'Warn+',
+    logsLevelError: 'Error only',
+    logsLevelDebug: 'All (debug)',
+    logsSearchPh: 'Filter...',
+    logsPause: 'Pause',
+    logsResume: 'Resume',
+    logsClear: 'Clear',
+    logsEmpty: 'No logs yet.',
+    logsStreamOn: 'Live',
+    logsStreamOff: 'Disconnected',
+    logsCounter: 'showing',
     footerLicense1: '<strong>License:</strong> Upstream Gemini CLI code remains Apache-2.0.',
     footerLicense2: 'gemini-api2cli-specific files in this fork are marked under CNC-1.0. See LICENSING.md for the current scope.',
   },
@@ -721,6 +796,22 @@ const I = {
     epQuotas: '获取所有凭据的额度。',
     epQuota: '获取指定凭据的额度。',
     epHealth: '健康检查。',
+    logs: '日志',
+    logsToggleCollapsed: '点击展开',
+    logsToggleExpanded: '点击收起',
+    logsDesc: '最近的服务端日志（内存环形缓冲）。展示前已自动脱敏。',
+    logsLevelInfo: 'Info 以上',
+    logsLevelWarn: 'Warn 以上',
+    logsLevelError: '仅错误',
+    logsLevelDebug: '全部（含 debug）',
+    logsSearchPh: '按关键字过滤...',
+    logsPause: '暂停',
+    logsResume: '继续',
+    logsClear: '清空',
+    logsEmpty: '暂无日志。',
+    logsStreamOn: '实时',
+    logsStreamOff: '未连接',
+    logsCounter: '条',
     footerLicense1: '<strong>许可说明：</strong>上游 Gemini CLI 代码仍然保持 Apache-2.0。',
     footerLicense2: '这个 fork 中新增的 gemini-api2cli 特定文件标记为 CNC-1.0。当前适用范围请查看 LICENSING.md。',
   },
@@ -816,6 +907,22 @@ function applyLang() {
   // API
   $('t-api-endpoints').textContent = t('apiEndpoints');
   $('t-api-desc').innerHTML = t('apiEndpointsDesc');
+  // Logs
+  $('t-logs').textContent = t('logs');
+  $('t-logs-desc').textContent = t('logsDesc');
+  $('t-logs-toggle').textContent = $('logs-card').open ? t('logsToggleExpanded') : t('logsToggleCollapsed');
+  $('logs-level-info').textContent = t('logsLevelInfo');
+  $('logs-level-warn').textContent = t('logsLevelWarn');
+  $('logs-level-error').textContent = t('logsLevelError');
+  $('logs-level-debug').textContent = t('logsLevelDebug');
+  $('logs-search').placeholder = t('logsSearchPh');
+  $('logs-pause-btn').textContent = Logs.paused ? t('logsResume') : t('logsPause');
+  $('logs-clear-btn').textContent = t('logsClear');
+  $('logs-stream-dot').title = Logs.streaming ? t('logsStreamOn') : t('logsStreamOff');
+  if (Logs.entries.length === 0 && $('logs-body').children.length === 0) {
+    $('logs-body').innerHTML = '<div class="logs-empty">'+esc(t('logsEmpty'))+'</div>';
+  }
+  updateLogsCounter();
   // Footer
   $('footer-license-1').innerHTML = t('footerLicense1');
   $('footer-license-2').textContent = t('footerLicense2');
@@ -874,7 +981,24 @@ $('auth-submit').onclick = async () => {
 
 $('token-input').onkeydown = e => { if (e.key === 'Enter') $('auth-submit').click(); };
 
+// Shared between logout and change-token so every token transition fully
+// tears down the SSE connection + cached entries tied to the old session.
+function resetLogsSession() {
+  try { stopLogsStream(); } catch {}
+  Logs.entries = [];
+  Logs.lastId = 0;
+  const card = $('logs-card');
+  if (card && card.open) card.open = false;
+  const body = $('logs-body');
+  if (body) body.innerHTML = '';
+}
+
 $('logout-btn').onclick = () => {
+  // Tear down the log stream first so the now-invalidated token stops
+  // riding on an open SSE connection, and clear any cached entries so a
+  // subsequent re-login doesn't surface the previous session's logs.
+  resetLogsSession();
+
   S.token = '';
   S.loginId = null;
   localStorage.removeItem(TOKEN_KEY);
@@ -1305,6 +1429,10 @@ $('change-token-btn').onclick = async () => {
   if (!newToken) { setNotice(t('tokenEmpty')); return; }
   try {
     await api('/v1/auth/token',{method:'PUT',body:JSON.stringify({token:newToken})});
+    // Tear down any SSE connection tied to the previous token's ticket
+    // before we swap — otherwise the old stream keeps receiving logs on
+    // a credential the user has just revoked.
+    resetLogsSession();
     // Update local state and re-login with new token
     S.token = newToken;
     localStorage.setItem(TOKEN_KEY, newToken);
@@ -1334,6 +1462,14 @@ $('retry-toggle').onchange = () => {
 $('save-settings-btn').onclick = async () => {
   try {
     const timeoutSec = parseFloat($('timeout-input').value) || 0;
+    // Idle timeout: 0 means "never timeout" — keep it distinct from an empty
+    // input. Only fall back to default (0) when the value is missing or
+    // negative; a user-entered "0" must round-trip as 0.
+    const acpIdleRaw = parseFloat($('acp-idle-input').value);
+    const acpIdleMs =
+      Number.isFinite(acpIdleRaw) && acpIdleRaw >= 0
+        ? Math.floor(acpIdleRaw * 1000)
+        : 0;
     const p = await api('/v1/settings',{
       method:'PUT',
       body:JSON.stringify({
@@ -1347,7 +1483,7 @@ $('save-settings-btn').onclick = async () => {
         proxyUrl: $('proxy-input').value.trim(),
         maxWorkers: parseInt($('max-workers-input').value, 10) || 0,
         failoverWorkers: parseInt($('failover-workers-input').value, 10) || 0,
-        acpIdleTimeoutMs: Math.floor((parseFloat($('acp-idle-input').value) || 300) * 1000),
+        acpIdleTimeoutMs: acpIdleMs,
       }),
     });
     $('settings-meta').textContent = t('settingsSaved');
@@ -1370,8 +1506,12 @@ async function loadSettings() {
     $('proxy-input').value = s.proxyUrl || '';
     $('max-workers-input').value = String(s.maxWorkers || 0);
     $('failover-workers-input').value = String(s.failoverWorkers || 0);
-    const acpIdleSec = (s.acpIdleTimeoutMs || 300000) / 1000;
-    $('acp-idle-input').value = String(acpIdleSec);
+    // Use a typeof check instead of "||" so a stored value of 0
+    // ("never timeout") displays as 0 in the input instead of being
+    // silently replaced with the old default.
+    const acpIdleMsStored =
+      typeof s.acpIdleTimeoutMs === 'number' ? s.acpIdleTimeoutMs : 0;
+    $('acp-idle-input').value = String(acpIdleMsStored / 1000);
     const timeoutSec = (s.timeoutMs || 0) / 1000;
     $('timeout-input').value = timeoutSec > 0 ? String(timeoutSec) : '0';
     const defSec = p.defaultTimeoutMs ? (p.defaultTimeoutMs / 1000) : 600;
@@ -1420,9 +1560,263 @@ function showErr(e) {
   setNotice(e instanceof Error ? e.message : String(e));
 }
 
+/* ── Logs Panel ── */
+const LOG_LEVEL_RANK = { debug:0, info:1, warn:2, error:3 };
+const Logs = {
+  entries: [],            // newest at the end, capped at MAX_CLIENT
+  MAX_CLIENT: 1000,       // client-side buffer cap (indep. of server ring)
+  lastId: 0,              // highest entry id we've seen
+  paused: false,          // when true, new entries are buffered but not rendered
+  streaming: false,       // SSE open?
+  es: null,               // EventSource handle
+  esReconnectTimer: 0,    // scheduled reconnect
+  minLevel: 'info',       // server-side level filter
+  keyword: '',            // client-side substring filter (case-insensitive)
+  autoScroll: true,       // flip off if the user scrolls away from bottom
+  renderPending: false,   // rAF batching
+};
+
+function fmtLogTs(ms) {
+  const d = new Date(ms);
+  const pad = (n, w = 2) => String(n).padStart(w, '0');
+  return pad(d.getHours())+':'+pad(d.getMinutes())+':'+pad(d.getSeconds())+'.'+pad(d.getMilliseconds(), 3);
+}
+
+function logMatchesFilter(entry) {
+  if (LOG_LEVEL_RANK[entry.level] < LOG_LEVEL_RANK[Logs.minLevel]) return false;
+  if (Logs.keyword && entry.message.toLowerCase().indexOf(Logs.keyword) < 0) return false;
+  return true;
+}
+
+function renderLogRow(entry) {
+  const row = document.createElement('div');
+  row.className = 'log-row lv-' + entry.level;
+  row.dataset.id = String(entry.id);
+  const ts = document.createElement('span'); ts.className = 'log-ts'; ts.textContent = fmtLogTs(entry.ts);
+  const lv = document.createElement('span'); lv.className = 'log-lv'; lv.textContent = entry.level;
+  const msg = document.createElement('span'); msg.className = 'log-msg'; msg.textContent = entry.message;
+  if (entry.rest && Object.keys(entry.rest).length > 0) {
+    const rest = document.createElement('span');
+    rest.className = 'log-rest';
+    try { rest.textContent = JSON.stringify(entry.rest); } catch { rest.textContent = '[unserializable]'; }
+    msg.appendChild(rest);
+  }
+  row.appendChild(ts); row.appendChild(lv); row.appendChild(msg);
+  return row;
+}
+
+function scheduleLogsRender() {
+  if (Logs.renderPending) return;
+  Logs.renderPending = true;
+  requestAnimationFrame(() => {
+    Logs.renderPending = false;
+    renderLogsBody();
+  });
+}
+
+function renderLogsBody() {
+  const body = $('logs-body');
+  if (!body) return;
+  body.innerHTML = '';
+  const visible = Logs.entries.filter(logMatchesFilter);
+  if (visible.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'logs-empty';
+    empty.textContent = t('logsEmpty');
+    body.appendChild(empty);
+    updateLogsCounter();
+    return;
+  }
+  const frag = document.createDocumentFragment();
+  for (const e of visible) frag.appendChild(renderLogRow(e));
+  body.appendChild(frag);
+  if (Logs.autoScroll) body.scrollTop = body.scrollHeight;
+  updateLogsCounter();
+}
+
+function updateLogsCounter() {
+  const counter = $('logs-counter');
+  if (!counter) return;
+  const visibleCount = Logs.entries.filter(logMatchesFilter).length;
+  const suffix = S.lang === 'zh' ? ' '+t('logsCounter') : ' '+t('logsCounter');
+  counter.textContent = visibleCount + '/' + Logs.entries.length + suffix;
+}
+
+function pushLogEntry(entry) {
+  if (entry.id <= Logs.lastId) return; // dedup
+  Logs.lastId = entry.id;
+  Logs.entries.push(entry);
+  if (Logs.entries.length > Logs.MAX_CLIENT) {
+    Logs.entries.splice(0, Logs.entries.length - Logs.MAX_CLIENT);
+  }
+  if (!Logs.paused && logMatchesFilter(entry)) {
+    scheduleLogsRender();
+  }
+}
+
+async function fetchLogsHistory() {
+  setNotice('');
+  try {
+    const r = await api('/v1/logs?level=' + encodeURIComponent(Logs.minLevel) + '&limit=500');
+    const entries = (r && r.entries) || [];
+    Logs.entries = entries.slice(-Logs.MAX_CLIENT);
+    // Track the highest id seen so live SSE pushes can skip duplicates
+    // (the server replays entries that may overlap with the snapshot).
+    Logs.lastId = Logs.entries.length > 0 ? Logs.entries[Logs.entries.length-1].id : 0;
+    renderLogsBody();
+  } catch (e) { showErr(e); }
+}
+
+// Fetch a single-use ticket for the SSE stream; the Bearer token stays in
+// the Authorization header (POST body), never in a URL.
+async function requestLogsStreamTicket() {
+  try {
+    const r = await api('/v1/logs/stream-ticket', { method: 'POST' });
+    return (r && r.ticket) || '';
+  } catch (e) {
+    showErr(e);
+    return '';
+  }
+}
+
+async function startLogsStream() {
+  // Guard both on the streaming flag AND on an already-live EventSource —
+  // between calling "new EventSource()" and onopen firing, streaming is
+  // still false, so relying on the flag alone can spawn duplicate streams.
+  if (Logs.streaming || Logs.es || !S.token) return;
+  const dot = $('logs-stream-dot');
+  const ticket = await requestLogsStreamTicket();
+  if (!ticket) {
+    if (dot) { dot.classList.add('off'); dot.title = t('logsStreamOff'); }
+    return;
+  }
+  // Race check: panel may have been closed while we awaited the ticket.
+  if (!$('logs-card') || !$('logs-card').open) return;
+  try {
+    // Pass the highest id we've already seen via ?afterId so the server can
+    // replay anything produced between "fetch history" and "SSE connected".
+    // On reconnect the browser additionally supplies Last-Event-ID; server
+    // prefers that header over this query.
+    const url =
+      '/v1/logs/stream?ticket=' + encodeURIComponent(ticket) +
+      (Logs.lastId > 0 ? '&afterId=' + Logs.lastId : '');
+    const es = new EventSource(url);
+    Logs.es = es;
+    es.onopen = () => {
+      Logs.streaming = true;
+      if (dot) { dot.classList.remove('off'); dot.title = t('logsStreamOn'); }
+    };
+    es.onmessage = (ev) => {
+      try {
+        const entry = JSON.parse(ev.data);
+        // Dedup against snapshot + earlier stream entries (server replay).
+        if (entry && typeof entry.id === 'number' && entry.id <= Logs.lastId) return;
+        pushLogEntry(entry);
+      } catch { /* ignore malformed */ }
+    };
+    // Server emits an "event: gap" when the resume point is older than the
+    // buffer's earliest entry. Surface this so the user knows some history
+    // is permanently lost (not just pending).
+    es.addEventListener('gap', (ev) => {
+      try {
+        const info = JSON.parse(ev.data);
+        setNotice(
+          (S.lang === 'zh' ? '日志 ' : 'Logs ') +
+          (info && info.lost ? info.lost : '?') +
+          (S.lang === 'zh' ? ' 条丢失（缓冲已溢出）' : ' entries dropped (buffer overflow)'),
+        );
+      } catch { /* ignore malformed */ }
+    });
+    es.onerror = () => {
+      Logs.streaming = false;
+      if (dot) { dot.classList.add('off'); dot.title = t('logsStreamOff'); }
+      try { es.close(); } catch {}
+      Logs.es = null;
+      // Auto-reconnect while panel is open. EventSource will resend the
+      // last event id via Last-Event-ID on reconnect, so the server can
+      // replay any entries produced during the downtime.
+      if ($('logs-card') && $('logs-card').open && !Logs.esReconnectTimer) {
+        Logs.esReconnectTimer = setTimeout(() => {
+          Logs.esReconnectTimer = 0;
+          startLogsStream().catch(() => {});
+        }, 3000);
+      }
+    };
+  } catch (e) {
+    Logs.streaming = false;
+    if (dot) dot.classList.add('off');
+  }
+}
+
+function stopLogsStream() {
+  if (Logs.esReconnectTimer) { clearTimeout(Logs.esReconnectTimer); Logs.esReconnectTimer = 0; }
+  if (Logs.es) { try { Logs.es.close(); } catch {} Logs.es = null; }
+  Logs.streaming = false;
+  const dot = $('logs-stream-dot');
+  if (dot) { dot.classList.add('off'); dot.title = t('logsStreamOff'); }
+}
+
+let _logsPanelBound = false;
+function bindLogsPanel() {
+  // Idempotent: showApp/boot may run more than once per page load (login,
+  // lang switch, etc.) — never attach the same handlers twice.
+  if (_logsPanelBound) return;
+  const card = $('logs-card');
+  const body = $('logs-body');
+  if (!card || !body) return;
+  _logsPanelBound = true;
+
+  card.addEventListener('toggle', () => {
+    $('t-logs-toggle').textContent = card.open ? t('logsToggleExpanded') : t('logsToggleCollapsed');
+    if (card.open) {
+      fetchLogsHistory()
+        .then(() => startLogsStream())
+        .catch(() => { /* errors already surfaced by showErr */ });
+    } else {
+      stopLogsStream();
+    }
+  });
+
+  $('logs-level').addEventListener('change', async (ev) => {
+    Logs.minLevel = ev.target.value;
+    await fetchLogsHistory();
+  });
+
+  $('logs-search').addEventListener('input', (ev) => {
+    Logs.keyword = (ev.target.value || '').toLowerCase();
+    renderLogsBody();
+  });
+
+  $('logs-pause-btn').addEventListener('click', () => {
+    Logs.paused = !Logs.paused;
+    $('logs-pause-btn').textContent = Logs.paused ? t('logsResume') : t('logsPause');
+    if (Logs.paused) {
+      body.classList.add('paused');
+    } else {
+      body.classList.remove('paused');
+      renderLogsBody();
+    }
+  });
+
+  $('logs-clear-btn').addEventListener('click', () => {
+    Logs.entries = [];
+    renderLogsBody();
+  });
+
+  body.addEventListener('scroll', () => {
+    // Turn off auto-scroll if user scrolls up; re-enable when they scroll back to bottom.
+    const atBottom = body.scrollHeight - body.scrollTop - body.clientHeight < 24;
+    Logs.autoScroll = atBottom;
+  });
+}
+
 /* ── Boot ── */
 async function boot() {
   applyLang();
+  // Wire up the logs panel FIRST so it remains available as a diagnostic tool
+  // even if loadSettings/refreshAll fail. bindLogsPanel is internally
+  // idempotent (re-entry safe after repeated logins).
+  try { bindLogsPanel(); } catch(e) { showErr(e); }
   try {
     await loadSettings();
     await refreshAll();

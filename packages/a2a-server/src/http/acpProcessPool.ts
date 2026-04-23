@@ -58,7 +58,9 @@ export interface AcpPoolSettings {
 }
 
 const GEMINI_DIR_NAME = '.gemini';
-const DEFAULT_IDLE_TIMEOUT_MS = 300_000; // 5 minutes
+// 0 means "never time out" — workers stay alive until explicit shutdown.
+// The admin console exposes this as seconds; see promptApiConsole.ts.
+const DEFAULT_IDLE_TIMEOUT_MS = 0;
 
 function buildAcpChildEnv(
   isolatedHomeDir: string,
@@ -115,7 +117,10 @@ export class AcpWorker {
     onDead?: () => void,
   ) {
     this.credentialId = credentialId;
-    this.idleTimeoutMs = idleTimeoutMs || DEFAULT_IDLE_TIMEOUT_MS;
+    // Use `??` so an explicit 0 ("never timeout") passes through unchanged.
+    // `||` would coerce 0 to the default, silently overriding the operator's
+    // choice to keep workers alive indefinitely.
+    this.idleTimeoutMs = idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS;
     this.onDead = onDead;
   }
 

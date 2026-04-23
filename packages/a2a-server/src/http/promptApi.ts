@@ -55,6 +55,7 @@ import {
 import type { FormatAdapter } from './adapters/types.js';
 import { geminiAdapter } from './adapters/geminiAdapter.js';
 import { openaiAdapter } from './adapters/openaiAdapter.js';
+import { logBuffer, type LogEntry } from './logBuffer.js';
 import {
   AcpProcessPool,
   type ContentBlock,
@@ -472,7 +473,11 @@ function createPromptApiState(
       extensionsEnabled: false,
       skillsEnabled: false,
       proxyUrl: '',
-      acpIdleTimeoutMs: 300000,
+      // Default: never time out. Workers stay warm across requests and are
+      // only recycled on credential failover or explicit kill. Operators can
+      // set a positive value (seconds, via the admin console) to trim idle
+      // processes on memory-constrained hosts.
+      acpIdleTimeoutMs: 0,
       maxWorkers: 2,
       failoverWorkers: 1,
     },
@@ -2519,6 +2524,166 @@ export function createPromptApiRouter(
       sessions: state.acpPool.getAllSessions(),
     }),
   );
+
+  // --- Logs panel endpoints ----------------------------------------------
+  // Historical snapshot (filters applied server-side so the client only
+  // receives already-scrubbed, level/keyword-matched rows).
+  router.get('/v1/logs', (req, res) => {
+    // Express parses req.query as ParsedQs where each value may be string |
+    // string[] | ParsedQs | undefined. Pull each raw value out to a local
+    // so the typeof guard operates on a variable (no-restricted-syntax
+    // forbids typeof on object property access).
+    const rawLevel = req.query['level'];
+    const rawQ = req.query['q'];
+    const rawLimit = req.query['limit'];
+    const rawAfterId = req.query['afterId'];
+    const levelParam = typeof rawLevel === 'string' ? rawLevel : undefined;
+    const q = typeof rawQ === 'string' ? rawQ : undefined;
+    const limitRaw = typeof rawLimit === 'string' ? rawLimit : undefined;
+    const afterIdRaw = typeof rawAfterId === 'string' ? rawAfterId : undefined;
+    const limit = limitRaw !== undefined ? Number(limitRaw) : undefined;
+    const afterId = afterIdRaw !== undefined ? Number(afterIdRaw) : undefined;
+
+    const entries = logBuffer.snapshot({
+      level:
+        levelParam === 'error' ||
+        levelParam === 'warn' ||
+        levelParam === 'info' ||
+        levelParam === 'debug'
+          ? levelParam
+          : undefined,
+      q,
+      limit: Number.isFinite(limit) ? limit : undefined,
+      afterId: Number.isFinite(afterId) ? afterId : undefined,
+    });
+    res.status(200).json({
+      entries,
+      capacity: logBuffer.maxSize,
+      size: logBuffer.size,
+    });
+  });
+
+  // Short-lived, single-origin tickets for the SSE stream. Issuing a ticket
+  // requires a valid Bearer token (goes through the existing auth middleware);
+  // the ticket itself carries no authority beyond opening one log stream and
+  // expires quickly. This keeps the long-lived admin token out of URLs,
+  // Referer headers, and proxy access logs.
+  const LOG_TICKET_TTL_MS = 5 * 60 * 1000;
+  const logStreamTickets = new Map<string, number>(); // ticket → expiresAt
+  const pruneLogTickets = () => {
+    const now = Date.now();
+    for (const [t, exp] of logStreamTickets) {
+      if (exp < now) logStreamTickets.delete(t);
+    }
+  };
+
+  router.post('/v1/logs/stream-ticket', (_req, res) => {
+    pruneLogTickets();
+    const ticket = randomUUID();
+    logStreamTickets.set(ticket, Date.now() + LOG_TICKET_TTL_MS);
+    res
+      .status(200)
+      .json({ ticket, expiresIn: Math.floor(LOG_TICKET_TTL_MS / 1000) });
+  });
+
+  // SSE live stream. Authentication via single-use ticket (see above) so the
+  // long-lived admin token never appears in this URL. Supports Last-Event-ID
+  // to replay entries that occurred while the client was disconnected.
+  // A periodic comment heartbeat prevents intermediary proxies (Nginx, CF)
+  // from closing the idle connection after ~60s.
+  router.get('/v1/logs/stream', (req, res) => {
+    const rawTicket = req.query['ticket'];
+    const ticket = typeof rawTicket === 'string' ? rawTicket : '';
+    pruneLogTickets();
+    const exp = logStreamTickets.get(ticket);
+    if (!exp || exp < Date.now()) {
+      res.status(401).json({ error: 'Invalid or expired log stream ticket.' });
+      return;
+    }
+    // DO NOT refresh TTL on use. A renewable ticket quickly devolves into a
+    // long-lived bearer (just reconnect every few minutes). The absolute
+    // 5-minute cap from POST /v1/logs/stream-ticket stands. When the ticket
+    // expires mid-stream, EventSource's onerror fires on the client, which
+    // triggers a fresh POST (Bearer-authed) to mint a new ticket.
+
+    res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.flushHeaders();
+
+    // Gap-free subscription. The critical detail is ordering:
+    //   1. Install the live listener FIRST so no new entry can slip past
+    //      between the snapshot and the subscription window.
+    //   2. Snapshot the backlog up to the current moment.
+    //   3. Replay the backlog, filtering out anything the client already has.
+    // Any entry the listener receives while we're still replaying will be
+    // queued to `res` and ordered by id downstream; the client-side dedup
+    // (skip when entry.id <= lastId) absorbs any overlap.
+    const listener = (entry: LogEntry) => {
+      try {
+        // Emit an `id:` line so the browser records it in lastEventId and
+        // sends it back as Last-Event-ID on reconnect (gap-free recovery).
+        res.write(`id: ${entry.id}\ndata: ${JSON.stringify(entry)}\n\n`);
+      } catch {
+        /* best effort */
+      }
+    };
+    logBuffer.on('entry', listener);
+
+    // Resume point preference:
+    //   - Last-Event-ID (set automatically by the browser on reconnect)
+    //   - ?afterId= query (sent by the client on the *first* connect after a
+    //     fresh snapshot fetch) — this closes the initial-open gap that
+    //     Last-Event-ID alone can't cover.
+    const lastEventHeader = req.headers['last-event-id'];
+    const lastEventId = Array.isArray(lastEventHeader)
+      ? Number(lastEventHeader[0])
+      : Number(lastEventHeader);
+    const afterIdQuery = Number(req.query['afterId']);
+    const resumeFrom =
+      Number.isFinite(lastEventId) && lastEventId > 0
+        ? lastEventId
+        : Number.isFinite(afterIdQuery) && afterIdQuery > 0
+          ? afterIdQuery
+          : 0;
+
+    // Emit a `gap` event if the requested resume point is older than the
+    // oldest entry still in the ring buffer — client can then warn or
+    // fetch the rest of the history out-of-band.
+    if (resumeFrom > 0) {
+      const snap = logBuffer.snapshot({ afterId: resumeFrom });
+      const earliestInBuffer = snap.length > 0 ? snap[0].id : resumeFrom + 1;
+      if (earliestInBuffer > resumeFrom + 1) {
+        const lost = earliestInBuffer - resumeFrom - 1;
+        res.write(
+          `event: gap\ndata: ${JSON.stringify({ lost, resumeFrom, earliestInBuffer })}\n\n`,
+        );
+      }
+      for (const entry of snap) {
+        try {
+          res.write(`id: ${entry.id}\ndata: ${JSON.stringify(entry)}\n\n`);
+        } catch {
+          /* best effort */
+        }
+      }
+    }
+
+    const heartbeat = setInterval(() => {
+      try {
+        res.write(': hb\n\n');
+      } catch {
+        /* connection already torn down */
+      }
+    }, 30_000);
+
+    const cleanup = () => {
+      clearInterval(heartbeat);
+      logBuffer.off('entry', listener);
+    };
+    req.on('aborted', cleanup);
+    req.on('close', cleanup);
+    res.on('close', cleanup);
+  });
 
   router.post('/v1/acp/sessions', async (req, res) => {
     try {

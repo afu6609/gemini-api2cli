@@ -114,13 +114,15 @@ export class CoderAgentExecutor implements AgentExecutor {
       return this.cachedConfig;
     }
 
+    const isTrusted = agentSettings.isTrusted ?? false;
     loadEnvironment(); // Will override any global env with workspace envs
-    const settings = loadSettings(workspaceRoot);
+    const settings = loadSettings(workspaceRoot, isTrusted);
     const extensions = loadExtensions(workspaceRoot);
     const config = await loadConfig(
       settings,
       new SimpleExtensionLoader(extensions),
       taskId,
+      isTrusted,
     );
 
     // Cache for subsequent tasks in the same workspace

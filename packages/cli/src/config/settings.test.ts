@@ -82,6 +82,7 @@ import {
   FatalConfigError,
   GEMINI_DIR,
   Storage,
+  AuthType,
   type MCPServerConfig,
 } from '@google/gemini-cli-core';
 import { updateSettingsFilePreservingFormat } from '../utils/commentJson.js';
@@ -202,6 +203,7 @@ describe('Settings Loading and Merging', () => {
 
   afterEach(() => {
     vi.restoreAllMocks();
+    vi.unstubAllEnvs();
   });
 
   describe('loadSettings', () => {
@@ -1104,6 +1106,77 @@ describe('Settings Loading and Merging', () => {
       expect(settings.merged.mcp).toEqual({
         allowed: ['system-allowed'],
         excluded: ['workspace-excluded'],
+      });
+    });
+
+    describe('LoadedSettings MCP consolidation', () => {
+      it('should consolidate mcp excluded list across all scopes', () => {
+        const loaded = new LoadedSettings(
+          {
+            path: '',
+            settings: { mcp: { excluded: ['system-excluded'] } },
+            originalSettings: {},
+          },
+          {
+            path: '',
+            settings: { mcp: { excluded: ['defaults-excluded'] } },
+            originalSettings: {},
+          },
+          {
+            path: '',
+            settings: { mcp: { excluded: ['user-excluded'] } },
+            originalSettings: {},
+          },
+          {
+            path: '',
+            settings: { mcp: { excluded: ['workspace-excluded'] } },
+            originalSettings: {},
+          },
+          true,
+        );
+
+        expect(loaded.getConsolidatedExcludedMcpServers()).toEqual([
+          'system-excluded',
+          'defaults-excluded',
+          'user-excluded',
+          'workspace-excluded',
+        ]);
+      });
+
+      it('should consolidate allowed mcp list via case-insensitive intersection', () => {
+        const loaded = new LoadedSettings(
+          {
+            path: '',
+            settings: { mcp: { allowed: ['Server-A', 'Server-B'] } },
+            originalSettings: {},
+          },
+          {
+            path: '',
+            settings: { mcp: { allowed: ['server-a', 'Server-C'] } },
+            originalSettings: {},
+          },
+          { path: '', settings: {}, originalSettings: {} }, // no allowlist in user
+          {
+            path: '',
+            settings: { mcp: { allowed: ['SERVER-A', 'Server-D'] } },
+            originalSettings: {},
+          },
+          true,
+        );
+
+        expect(loaded.getConsolidatedAllowedMcpServers()).toEqual(['Server-A']);
+      });
+
+      it('should return undefined allowed list if no scopes define one', () => {
+        const loaded = new LoadedSettings(
+          { path: '', settings: {}, originalSettings: {} },
+          { path: '', settings: {}, originalSettings: {} },
+          { path: '', settings: {}, originalSettings: {} },
+          { path: '', settings: {}, originalSettings: {} },
+          true,
+        );
+
+        expect(loaded.getConsolidatedAllowedMcpServers()).toBeUndefined();
       });
     });
 
@@ -3003,6 +3076,44 @@ describe('Settings Loading and Merging', () => {
       expect(snap1).toBe(snap2);
     });
 
+    it('getSnapshot() should preserve readOnly metadata for each scope', () => {
+      const readonlySettings = new LoadedSettings(
+        {
+          path: getSystemSettingsPath(),
+          settings: {},
+          originalSettings: {},
+          readOnly: true,
+        },
+        {
+          path: getSystemDefaultsPath(),
+          settings: {},
+          originalSettings: {},
+          readOnly: true,
+        },
+        {
+          path: USER_SETTINGS_PATH,
+          settings: {},
+          originalSettings: {},
+          readOnly: false,
+        },
+        {
+          path: MOCK_WORKSPACE_SETTINGS_PATH,
+          settings: {},
+          originalSettings: {},
+          readOnly: true,
+        },
+        true,
+        [],
+      );
+
+      const snapshot = readonlySettings.getSnapshot();
+
+      expect(snapshot.system.readOnly).toBe(true);
+      expect(snapshot.systemDefaults.readOnly).toBe(true);
+      expect(snapshot.user.readOnly).toBe(false);
+      expect(snapshot.workspace.readOnly).toBe(true);
+    });
+
     it('setValue() should create a new snapshot reference and emit event', () => {
       const oldSnapshot = loadedSettings.getSnapshot();
       const oldUserRef = oldSnapshot.user.settings;
@@ -3036,6 +3147,7 @@ describe('Settings Loading and Merging', () => {
       delete process.env['CLOUD_SHELL'];
       delete process.env['MALICIOUS_VAR'];
       delete process.env['FOO'];
+      delete process.env['_GEMINI_USER_GCP_PROJECT'];
       vi.resetAllMocks();
       vi.mocked(fs.existsSync).mockReturnValue(false);
     });
@@ -3266,6 +3378,134 @@ MALICIOUS_VAR=allowed-because-trusted
         );
 
         expect(process.env['GOOGLE_CLOUD_PROJECT']).toBe('cloudshell-gca');
+      });
+
+      it('should not override GOOGLE_CLOUD_PROJECT in Cloud Shell when auth type is vertex-ai', () => {
+        vi.stubEnv('CLOUD_SHELL', 'true');
+        vi.stubEnv('GOOGLE_CLOUD_PROJECT', 'my-vertex-project');
+        process.argv = ['node', 'gemini', '-s', 'prompt'];
+        vi.mocked(isWorkspaceTrusted).mockReturnValue({
+          isTrusted: false,
+          source: 'file',
+        });
+
+        // No .env file
+        vi.mocked(fs.existsSync).mockReturnValue(false);
+
+        loadEnvironment(
+          createMockSettings({
+            tools: { sandbox: false },
+            security: { auth: { selectedType: AuthType.USE_VERTEX_AI } },
+          }).merged,
+          MOCK_WORKSPACE_DIR,
+        );
+
+        expect(process.env['GOOGLE_CLOUD_PROJECT']).toBe('my-vertex-project');
+      });
+
+      it('should respect .env override for GOOGLE_CLOUD_PROJECT in Cloud Shell when auth type is vertex-ai', () => {
+        vi.stubEnv('CLOUD_SHELL', 'true');
+        vi.stubEnv('GOOGLE_CLOUD_PROJECT', 'my-vertex-project');
+        process.argv = ['node', 'gemini', '-s', 'prompt'];
+        vi.mocked(isWorkspaceTrusted).mockReturnValue({
+          isTrusted: true,
+          source: 'file',
+        });
+
+        // Mock .env file to override the shell project
+        vi.mocked(fs.existsSync).mockReturnValue(true);
+        vi.mocked(fs.readFileSync).mockReturnValue(
+          'GOOGLE_CLOUD_PROJECT=env-vertex-project',
+        );
+
+        loadEnvironment(
+          createMockSettings({
+            tools: { sandbox: false },
+            security: { auth: { selectedType: AuthType.USE_VERTEX_AI } },
+          }).merged,
+          MOCK_WORKSPACE_DIR,
+        );
+
+        expect(process.env['GOOGLE_CLOUD_PROJECT']).toBe('env-vertex-project');
+      });
+
+      it('should clear cloudshell-gca when switching to Vertex AI without an original project', () => {
+        process.env['CLOUD_SHELL'] = 'true';
+        process.argv = ['node', 'gemini', '-s', 'prompt'];
+        vi.mocked(isWorkspaceTrusted).mockReturnValue({
+          isTrusted: false,
+          source: 'file',
+        });
+        vi.mocked(fs.existsSync).mockReturnValue(false);
+
+        // First call: normal Cloud Shell auth sets cloudshell-gca
+        loadEnvironment(
+          createMockSettings({ tools: { sandbox: false } }).merged,
+          MOCK_WORKSPACE_DIR,
+        );
+        expect(process.env['GOOGLE_CLOUD_PROJECT']).toBe('cloudshell-gca');
+
+        // Second call: user switched to Vertex AI, should remove cloudshell-gca
+        loadEnvironment(
+          createMockSettings({
+            tools: { sandbox: false },
+            security: { auth: { selectedType: AuthType.USE_VERTEX_AI } },
+          }).merged,
+          MOCK_WORKSPACE_DIR,
+        );
+        expect(process.env['GOOGLE_CLOUD_PROJECT']).toBeUndefined();
+      });
+
+      it('should restore original project when switching to Vertex AI after Cloud Shell override', () => {
+        process.env['CLOUD_SHELL'] = 'true';
+        process.env['GOOGLE_CLOUD_PROJECT'] = 'my-real-project';
+        process.argv = ['node', 'gemini', '-s', 'prompt'];
+        vi.mocked(isWorkspaceTrusted).mockReturnValue({
+          isTrusted: false,
+          source: 'file',
+        });
+        vi.mocked(fs.existsSync).mockReturnValue(false);
+
+        // First call: saves original to _GEMINI_USER_GCP_PROJECT, sets cloudshell-gca
+        loadEnvironment(
+          createMockSettings({ tools: { sandbox: false } }).merged,
+          MOCK_WORKSPACE_DIR,
+        );
+        expect(process.env['GOOGLE_CLOUD_PROJECT']).toBe('cloudshell-gca');
+        expect(process.env['_GEMINI_USER_GCP_PROJECT']).toBe('my-real-project');
+
+        // Second call: switching to Vertex AI should restore the saved value
+        loadEnvironment(
+          createMockSettings({
+            tools: { sandbox: false },
+            security: { auth: { selectedType: AuthType.USE_VERTEX_AI } },
+          }).merged,
+          MOCK_WORKSPACE_DIR,
+        );
+        expect(process.env['GOOGLE_CLOUD_PROJECT']).toBe('my-real-project');
+      });
+
+      it('should restore project after restart when child inherits cloudshell-gca', () => {
+        // Simulate child process after restart: inherits cloudshell-gca and
+        // the saved original from the parent process.
+        process.env['CLOUD_SHELL'] = 'true';
+        process.env['GOOGLE_CLOUD_PROJECT'] = 'cloudshell-gca';
+        process.env['_GEMINI_USER_GCP_PROJECT'] = 'my-real-project';
+        process.argv = ['node', 'gemini', '-s', 'prompt'];
+        vi.mocked(isWorkspaceTrusted).mockReturnValue({
+          isTrusted: false,
+          source: 'file',
+        });
+        vi.mocked(fs.existsSync).mockReturnValue(false);
+
+        loadEnvironment(
+          createMockSettings({
+            tools: { sandbox: false },
+            security: { auth: { selectedType: AuthType.USE_VERTEX_AI } },
+          }).merged,
+          MOCK_WORKSPACE_DIR,
+        );
+        expect(process.env['GOOGLE_CLOUD_PROJECT']).toBe('my-real-project');
       });
 
       it('should sanitize GOOGLE_CLOUD_PROJECT in Cloud Shell when loaded from .env in untrusted mode', () => {
